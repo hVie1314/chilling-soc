@@ -17,6 +17,7 @@ from contextlib import asynccontextmanager
 from typing import Literal
 
 import numpy as np
+# pyrefly: ignore [missing-import]
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from openai import AsyncOpenAI
@@ -36,9 +37,9 @@ QDRANT_HOST: str = os.getenv("QDRANT_HOST", "localhost")
 QDRANT_PORT: int = int(os.getenv("QDRANT_PORT", "6333"))
 LLM_BASE_URL: str = os.getenv("LLM_BASE_URL", "http://localhost:8000/v1")
 COLLECTION_NAME: str = os.getenv("COLLECTION_NAME", "soc_knowledge_base")
-EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "nomic-ai/nomic-embed-text-v1.5")
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "info").upper()
-EMBEDDING_DIM: int = 384  # all-MiniLM-L6-v2 output dimension
+EMBEDDING_DIM: int = 768  # nomic-embed-text-v1.5 output dimension
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(name)s — %(message)s")
 logger = logging.getLogger("soc-api")
@@ -98,7 +99,7 @@ async def lifespan(application: FastAPI):  # noqa: ARG001
 
     # ── Sentence-Transformer embedder ──
     logger.info("Loading embedding model '%s' ...", EMBEDDING_MODEL)
-    embedder = SentenceTransformer(EMBEDDING_MODEL)
+    embedder = SentenceTransformer(EMBEDDING_MODEL, trust_remote_code=True)
     logger.info("Embedding model loaded.")
 
     # ── Qdrant client ──

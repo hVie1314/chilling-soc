@@ -4,6 +4,8 @@
 
 A 4-container microservices architecture that uses a cybersecurity-tuned LLM (**Foundation-Sec-8B**) to automatically classify raw security logs as **False Positive**, **True Positive**, or **Incident** — and learns from analyst corrections over time.
 
+The embedding model (`nomic-ai/nomic-embed-text-v1.5`) supports an **8192-token context window**, ensuring long log entries — including trailing Base64 payloads, RCE strings, and encoded parameters — are fully captured without truncation. Analyst feedback is persisted to host-mounted volumes, so RAG memories survive container rebuilds and restarts.
+
 ---
 
 ## Architecture
@@ -73,6 +75,15 @@ sudo nvidia-ctk runtime configure --runtime=docker
 sudo systemctl restart docker
 ```
 
+### 4. HuggingFace Token
+
+`fdtn-ai/Foundation-Sec-8B` is a **gated model**. You need a HuggingFace **Read** token to download it:
+
+1. Create a free account at [huggingface.co](https://huggingface.co/join)
+2. Go to the [Foundation-Sec-8B model page](https://huggingface.co/fdtn-ai/Foundation-Sec-8B) and accept the license/access terms
+3. Generate a **Read** token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
+4. You will add this token to a `.env` file in the next section
+
 ---
 
 ## Quick Start
@@ -83,18 +94,23 @@ sudo systemctl restart docker
 cd soc-ai-triage
 ```
 
-### 2. (Optional) Set Hugging Face Token
+### 2. Create `.env` File
 
-If `fdtn-ai/Foundation-Sec-8B` is a gated model, export your token:
+Create a `.env` file in the project root with your HuggingFace token:
 
 ```bash
-export HF_TOKEN=hf_your_token_here
+# Linux / macOS
+echo 'HF_TOKEN=hf_your_actual_token' > .env
 ```
 
-On Windows PowerShell:
 ```powershell
-$env:HF_TOKEN = "hf_your_token_here"
+# Windows PowerShell
+Set-Content -Path .env -Value 'HF_TOKEN=hf_your_actual_token'
 ```
+
+A template `.env` file is already included — just replace the placeholder value.
+
+> **⚠️ Do not commit `.env` to version control.** Add it to `.gitignore`.
 
 ### 3. Build & Launch
 
@@ -103,9 +119,11 @@ docker compose up --build -d
 ```
 
 > **First run** will take 10-30 minutes as it:
-> - Downloads the Foundation-Sec-8B model weights (~16 GB)
-> - Downloads the `all-MiniLM-L6-v2` embedding model (~80 MB)
+> - Downloads the Foundation-Sec-8B model weights (~16 GB) into `./model_cache/`
+> - Downloads the `nomic-ai/nomic-embed-text-v1.5` embedding model (~270 MB)
 > - Builds the backend and frontend Docker images
+>
+> Subsequent starts are fast — model weights and Qdrant data are persisted on the host.
 
 ### 4. Monitor Startup
 
@@ -226,17 +244,21 @@ Liveness probe.
 ```
 soc-ai-triage/
 ├── docker-compose.yml          # Full stack orchestration
+├── .env                        # HF_TOKEN (not committed to git)
 ├── README.md                   # This file
 │
 ├── api-backend/
-│   ├── Dockerfile              # Python 3.11 + sentence-transformers
-│   ├── requirements.txt        # FastAPI, openai, qdrant-client, etc.
+│   ├── Dockerfile              # Python 3.11 + sentence-transformers + einops
+│   ├── requirements.txt        # FastAPI, openai, qdrant-client, einops, etc.
 │   └── main.py                 # Async FastAPI: /analyze, /feedback, /health
 │
-└── web-ui/
-    ├── Dockerfile              # Python 3.11 + Streamlit
-    ├── requirements.txt        # streamlit, httpx
-    └── app.py                  # Analyst triage UI
+├── web-ui/
+│   ├── Dockerfile              # Python 3.11 + Streamlit
+│   ├── requirements.txt        # streamlit, httpx
+│   └── app.py                  # Analyst triage UI
+│
+├── qdrant_data/                # (auto-created) persistent Qdrant storage
+└── model_cache/                # (auto-created) cached HF model weights
 ```
 
 ---
@@ -251,7 +273,7 @@ All configuration is via environment variables set in `docker-compose.yml`:
 | `QDRANT_PORT`      | api-backend   | `6333`                               | Qdrant REST port                 |
 | `LLM_BASE_URL`     | api-backend   | `http://llm-engine:8000/v1`          | vLLM OpenAI-compatible endpoint  |
 | `COLLECTION_NAME`  | api-backend   | `soc_knowledge_base`                 | Qdrant collection name           |
-| `EMBEDDING_MODEL`  | api-backend   | `all-MiniLM-L6-v2`                   | Sentence-transformer model       |
+| `EMBEDDING_MODEL`  | api-backend   | `nomic-ai/nomic-embed-text-v1.5`     | Sentence-transformer model (8192 tokens) |
 | `HF_TOKEN`         | llm-engine    | *(empty)*                            | Hugging Face token (if needed)   |
 | `API_BACKEND_URL`  | web-ui        | `http://api-backend:8080`            | Backend URL for Streamlit        |
 
@@ -273,11 +295,12 @@ All configuration is via environment variables set in `docker-compose.yml`:
 ## Stopping the System
 
 ```bash
-# Stop all containers (preserves data)
+# Stop all containers (data in ./qdrant_data and ./model_cache is preserved)
 docker compose down
 
-# Stop and remove all data (model cache + Qdrant vectors)
-docker compose down -v
+# Stop and delete persistent data
+docker compose down
+rm -rf qdrant_data model_cache
 ```
 
 ---

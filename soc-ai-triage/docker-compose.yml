@@ -14,7 +14,7 @@ services:
       - "6333:6333"   # REST API
       - "6334:6334"   # gRPC
     volumes:
-      - qdrant_data:/qdrant/storage
+      - ./qdrant_data:/qdrant/storage
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:6333/healthz || exit 1"]
       interval: 10s
@@ -32,7 +32,9 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - model_cache:/root/.cache/huggingface
+      - ./model_cache:/root/.cache/huggingface
+    env_file:
+      - .env
     environment:
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
     command: >
@@ -73,7 +75,7 @@ services:
       - QDRANT_PORT=6333
       - LLM_BASE_URL=http://llm-engine:8000/v1
       - COLLECTION_NAME=soc_knowledge_base
-      - EMBEDDING_MODEL=all-MiniLM-L6-v2
+      - EMBEDDING_MODEL=nomic-ai/nomic-embed-text-v1.5
       - LOG_LEVEL=info
     depends_on:
       vector-db:
@@ -107,11 +109,7 @@ services:
       - soc-net
     restart: unless-stopped
 
-volumes:
-  qdrant_data:
-    driver: local
-  model_cache:
-    driver: local
+volumes: {}
 
 networks:
   soc-net:
