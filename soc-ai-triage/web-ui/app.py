@@ -3,10 +3,10 @@ SOC AI Triage System — Streamlit Web Interface
 
 Provides:
   • Text area to paste raw security logs
-  • "Analyze" button → calls POST /analyze
+  • "Analyze" button → calls POST /analyze with events list
   • Parsed JSON result display with severity badge
-  • Similar past cases panel (RAG hits)
-  • Feedback form → calls POST /feedback
+  • Similar past cases panel (RAG hits) with trust scores
+  • Feedback form → calls POST /feedback with gradual trust response
 """
 
 from __future__ import annotations
@@ -72,6 +72,14 @@ st.markdown(
         font-weight: 700;
         font-size: 1.1rem;
         letter-spacing: 0.5px;
+    }
+
+    /* ── Trust score bar ───────────────────────────────── */
+    .trust-bar {
+        display: inline-block;
+        font-size: 0.85rem;
+        opacity: 0.85;
+        margin-left: 8px;
     }
 
     /* ── Similar-case card ──────────────────────────────── */
@@ -140,6 +148,12 @@ with st.sidebar:
         "4. Your feedback trains future analysis"
     )
 
+# ───────────────────────── Helpers ───────────────────────────────
+
+def _trust_stars(score: int, max_score: int = 5) -> str:
+    """Render trust score as filled/empty star icons."""
+    return "★" * score + "☆" * (max_score - score)
+
 # ───────────────────────── Main Content ──────────────────────────
 
 st.markdown('<p class="main-header">🛡️ SOC AI Triage</p>', unsafe_allow_html=True)
@@ -173,7 +187,7 @@ if analyze_clicked:
             try:
                 resp = httpx.post(
                     f"{API_URL}/analyze",
-                    json={"raw_log": raw_log.strip()},
+                    json={"events": [raw_log.strip()]},
                     timeout=REQUEST_TIMEOUT,
                 )
                 resp.raise_for_status()
@@ -217,9 +231,18 @@ if result:
         st.divider()
         st.subheader("📚 Similar Past Cases")
         for i, case in enumerate(cases, 1):
-            with st.expander(f"Case {i}  —  {case.get('label', '?')}  (score: {case.get('score', '?')})"):
+            trust = case.get("trust_score", 1)
+            trust_display = _trust_stars(trust)
+            label = case.get("label", "?")
+            score = case.get("score", "?")
+            with st.expander(
+                f"Case {i}  —  {label}  (score: {score})  |  Trust: {trust_display}"
+            ):
                 st.code(case.get("raw_log", "—"), language="text")
-                st.caption(f"**Analyst comment:** {case.get('analyst_comment', '—')}")
+                st.caption(
+                    f"**Trust Score:** {trust}/5 {trust_display}\n\n"
+                    f"**Analyst comment:** {case.get('comment', '—')}"
+                )
 
     # ── Feedback Form ────────────────────────────────────────────
     st.divider()
@@ -262,8 +285,21 @@ if result:
                         )
                         fb_resp.raise_for_status()
                         fb_data = fb_resp.json()
+
+                        action = fb_data.get("action", "stored")
+                        trust = fb_data.get("trust_score", 1)
+                        point_id = fb_data.get("point_id", "?")
+
+                        action_labels = {
+                            "inserted": "🆕 New entry created",
+                            "reinforced": "🔄 Existing entry reinforced",
+                            "corrected": "⚠️ Label corrected (trust reset)",
+                        }
+                        action_label = action_labels.get(action, action)
+
                         st.success(
-                            f"Feedback saved! Point ID: `{fb_data.get('point_id', '?')}`",
+                            f"{action_label}  |  Trust: {_trust_stars(trust)} ({trust}/5)  |  "
+                            f"Point ID: `{point_id}`",
                             icon="✅",
                         )
                     except httpx.HTTPStatusError as e:

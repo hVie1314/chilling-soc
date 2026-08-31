@@ -2,8 +2,8 @@
 SOC AI Triage System — FastAPI Backend (Orchestrator)
 
 Responsibilities:
-  • POST /analyze  – Embed log → RAG lookup → LLM triage → return JSON verdict
-  • POST /feedback – Embed log → store analyst feedback into Qdrant
+  • POST /analyze  – Embed events → RAG lookup → LLM triage → return JSON verdict
+  • POST /feedback – Embed log → gradual trust upsert into Qdrant
   • GET  /health   – Liveness probe
 """
 
@@ -43,13 +43,17 @@ EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "nomic-ai/nomic-embed-text-v
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "info").upper()
 EMBEDDING_DIM: int = 768  # nomic-embed-text-v1.5 output dimension
 
+SIMILARITY_THRESHOLD: float = 0.92  # Threshold for feedback deduplication
+MAX_TRUST_SCORE: int = 5
+
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(name)s — %(message)s")
 logger = logging.getLogger("soc-api")
 
 # ───────────────────────── Pydantic Models ───────────────────────
 
 class AnalyzeRequest(BaseModel):
-    raw_log: str = Field(..., min_length=1, description="Raw security log entry")
+    alert_id: str = Field(default="web-dummy", description="Alert identifier")
+    events: list[str] = Field(..., min_length=1, description="List of raw event log entries")
 
 
 class TriageResult(BaseModel):
@@ -64,14 +68,16 @@ class AnalyzeResponse(BaseModel):
 
 
 class FeedbackRequest(BaseModel):
-    raw_log: str = Field(..., min_length=1)
+    raw_log: str = Field(..., min_length=1, description="Raw log entry to store feedback for")
     label: Literal["FP", "TP", "Incident"]
-    analyst_comment: str = Field(default="", description="Optional analyst note")
+    analyst_comment: str = Field(default="", description="Analyst comment for the feedback")
 
 
 class FeedbackResponse(BaseModel):
     status: str
     point_id: str
+    action: str = Field(default="inserted", description="'inserted', 'reinforced', or 'corrected'")
+    trust_score: int = Field(default=1)
 
 # ───────────────────────── Global Resources ──────────────────────
 
@@ -125,7 +131,7 @@ async def lifespan(application: FastAPI):  # noqa: ARG001
 app = FastAPI(
     title="SOC AI Triage API",
     description="Security Operations Center – AI-powered log triage with RAG feedback loop",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -148,6 +154,7 @@ def _search_similar(vector: list[float], top_k: int = 2) -> list[dict]:
     """
     Search Qdrant for the most similar past cases.
     Returns an empty list when the collection is empty (first-run graceful).
+    Includes trust_score and comment in returned payloads.
     """
     try:
         collection_info = qdrant.get_collection(COLLECTION_NAME)  # type: ignore[union-attr]
@@ -169,7 +176,8 @@ def _search_similar(vector: list[float], top_k: int = 2) -> list[dict]:
                     "score": round(hit.score, 4),
                     "raw_log": payload.get("raw_log", ""),
                     "label": payload.get("label", ""),
-                    "analyst_comment": payload.get("analyst_comment", ""),
+                    "comment": payload.get("comment", payload.get("analyst_comment", "")),
+                    "trust_score": payload.get("trust_score", 1),
                 }
             )
         return results
@@ -178,35 +186,42 @@ def _search_similar(vector: list[float], top_k: int = 2) -> list[dict]:
         return []
 
 
-def _build_prompt(raw_log: str, similar_cases: list[dict]) -> list[dict]:
+def _build_prompt(events: list[str], similar_cases: list[dict]) -> list[dict]:
     """
-    Build the Chat Completions messages list.
-    Includes RAG context when available, gracefully omits when not.
+    Build the Chat Completions messages list for multi-event alerts.
+    Includes trust-aware RAG context and strict Vietnamese output instructions.
     """
     system_content = (
-        "You are a senior SOC analyst AI. Your task is to triage a security log entry.\n"
-        "Classify the log as exactly one of: FP (False Positive), TP (True Positive), or Incident.\n"
-        "You MUST respond with ONLY a valid JSON object in this exact schema:\n"
-        '{"result": "FP" | "TP" | "Incident", "reason": "<1-2 sentence explanation>"}\n'
-        "Do NOT include any text outside the JSON object."
+        "You are a senior SOC analyst AI. Your task is to triage a security alert containing one or more event logs.\n"
+        "STRICT RULES:\n"
+        "1. Output ONLY a valid JSON object: {\"result\": \"FP\" | \"TP\" | \"Incident\", \"reason\": \"<Vietnamese explanation>\"}\n"
+        "2. If ANY event in the alert is malicious, the whole result MUST be TP or Incident.\n"
+        "3. The 'reason' MUST be written in Vietnamese.\n"
+        "4. The 'reason' MUST be concise (maximum 1-2 sentences). "
+        "If a TP or malicious event exists, do NOT explain FP logs; only explain the malicious event.\n"
+        "5. Do NOT include any text outside the JSON object.\n"
     )
 
     user_parts: list[str] = []
 
-    # RAG context
+    # RAG context with trust scoring
     if similar_cases:
-        user_parts.append("### Similar Past Cases (from analyst knowledge base):")
-        for idx, case in enumerate(similar_cases, 1):
+        user_parts.append("### Analyst Knowledge Base (past verdicts):")
+        for case in similar_cases:
+            trust = case.get("trust_score", 1)
+            label = case.get("label", "?")
+            comment = case.get("comment", "")
             user_parts.append(
-                f"Case {idx} (similarity {case['score']}):\n"
-                f"  Log: {case['raw_log']}\n"
-                f"  Verdict: {case['label']}\n"
-                f"  Analyst note: {case['analyst_comment']}"
+                f"- Log pattern matched. Analyst labelled as [{label}] "
+                f"with Trust Score [{trust}/{MAX_TRUST_SCORE}]. "
+                f"Comment: [{comment}]"
             )
         user_parts.append("")  # blank line separator
 
-    user_parts.append("### New Log Entry to Triage:")
-    user_parts.append(raw_log)
+    # Enumerated event list
+    user_parts.append("### Alert Events to Triage:")
+    for idx, event in enumerate(events, 1):
+        user_parts.append(f"  {idx}. {event}")
 
     return [
         {"role": "system", "content": system_content},
@@ -275,26 +290,47 @@ async def health_check():
     "/analyze",
     response_model=AnalyzeResponse,
     tags=["triage"],
-    summary="Triage a raw security log",
+    summary="Triage a multi-event security alert",
 )
 async def analyze_log(req: AnalyzeRequest):
     """
-    1. Embed the raw log.
-    2. Retrieve top-2 similar past cases from Qdrant (RAG).
-    3. Construct a prompt and call the LLM via OpenAI-compatible Chat Completions API.
+    1. Iterate through events, embed each unique event.
+    2. Query Qdrant per event and aggregate RAG context (deduplicated).
+    3. Construct a multi-event prompt and call the LLM.
     4. Parse the structured JSON verdict and return it.
     """
-    logger.info("Received /analyze request (%d chars).", len(req.raw_log))
+    logger.info(
+        "Received /analyze request — alert_id=%s, %d event(s).",
+        req.alert_id, len(req.events),
+    )
 
-    # Step 1 – embed
-    vector = _embed(req.raw_log)
+    # Step 1 & 2 – embed each unique event and aggregate RAG results
+    seen_events: set[str] = set()
+    aggregated_cases: list[dict] = []
+    seen_rag_logs: set[str] = set()  # deduplicate RAG hits across events
 
-    # Step 2 – RAG retrieval
-    similar_cases = _search_similar(vector, top_k=2)
-    logger.info("RAG returned %d similar case(s).", len(similar_cases))
+    for event in req.events:
+        event_stripped = event.strip()
+        if not event_stripped or event_stripped in seen_events:
+            continue
+        seen_events.add(event_stripped)
 
-    # Step 3 – build prompt
-    messages = _build_prompt(req.raw_log, similar_cases)
+        vector = _embed(event_stripped)
+        cases = _search_similar(vector, top_k=2)
+
+        for case in cases:
+            rag_log = case.get("raw_log", "")
+            if rag_log not in seen_rag_logs:
+                seen_rag_logs.add(rag_log)
+                aggregated_cases.append(case)
+
+    logger.info("RAG returned %d unique similar case(s) across all events.", len(aggregated_cases))
+
+    # Step 3 – build multi-event prompt
+    messages = _build_prompt(
+        [e.strip() for e in req.events if e.strip()],
+        aggregated_cases,
+    )
 
     # Step 4 – call LLM
     # Try with guided_json (vLLM structured output) first;
@@ -351,7 +387,7 @@ async def analyze_log(req: AnalyzeRequest):
     return AnalyzeResponse(
         result=triage.result,
         reason=triage.reason,
-        similar_cases=similar_cases,
+        similar_cases=aggregated_cases,
     )
 
 
@@ -359,18 +395,85 @@ async def analyze_log(req: AnalyzeRequest):
     "/feedback",
     response_model=FeedbackResponse,
     tags=["feedback"],
-    summary="Submit analyst feedback to the knowledge base",
+    summary="Submit analyst feedback with gradual trust scoring",
 )
 async def submit_feedback(req: FeedbackRequest):
     """
-    Embed the raw log and upsert a new point into Qdrant with the
-    analyst-provided label and comment, enriching future RAG retrieval.
+    Embed the raw log and apply gradual trust scoring:
+      - No close match (score <= 0.92): INSERT new point with trust_score=1.
+      - Close match, same label: REINFORCE — increment trust_score (max 5), update comment.
+      - Close match, different label: CORRECT — overwrite label & comment, reset trust_score=1.
     """
     logger.info("Received /feedback — label=%s, comment=%s", req.label, req.analyst_comment[:80])
 
     vector = _embed(req.raw_log)
-    point_id = str(uuid.uuid4())
 
+    # ── Query Qdrant for top-1 match to check for near-duplicate ──
+    existing_match = None
+    try:
+        collection_info = qdrant.get_collection(COLLECTION_NAME)  # type: ignore[union-attr]
+        if collection_info.points_count > 0:
+            hits = qdrant.search(  # type: ignore[union-attr]
+                collection_name=COLLECTION_NAME,
+                query_vector=vector,
+                limit=1,
+                with_payload=True,
+            )
+            if hits and hits[0].score > SIMILARITY_THRESHOLD:
+                existing_match = hits[0]
+                logger.info(
+                    "Found existing match (score=%.4f, id=%s, label=%s).",
+                    existing_match.score, existing_match.id,
+                    (existing_match.payload or {}).get("label", "?"),
+                )
+    except Exception:
+        logger.exception("Qdrant search during feedback failed — will insert as new.")
+
+    # ── Determine action: insert / reinforce / correct ──
+    if existing_match is None:
+        # No close match → INSERT new point
+        point_id = str(uuid.uuid4())
+        trust_score = 1
+        action = "inserted"
+        payload = {
+            "raw_log": req.raw_log,
+            "label": req.label,
+            "comment": req.analyst_comment,
+            "trust_score": trust_score,
+        }
+        logger.info("No close match — inserting new point (id=%s).", point_id)
+    else:
+        # Reuse the existing point's ID to avoid duplicates
+        point_id = str(existing_match.id)
+        existing_payload = existing_match.payload or {}
+        existing_label = existing_payload.get("label", "")
+        existing_trust = existing_payload.get("trust_score", 1)
+
+        if existing_label == req.label:
+            # Same label → REINFORCE: increment trust, update comment
+            trust_score = min(existing_trust + 1, MAX_TRUST_SCORE)
+            action = "reinforced"
+            logger.info(
+                "Same label — reinforcing (trust_score %d → %d).",
+                existing_trust, trust_score,
+            )
+        else:
+            # Different label → CORRECT: overwrite label, reset trust
+            trust_score = 1
+            action = "corrected"
+            logger.info(
+                "Label conflict (%s → %s) — correcting, trust reset to 1.",
+                existing_label, req.label,
+            )
+
+        payload = {
+            "raw_log": req.raw_log,
+            "label": req.label,
+            "comment": req.analyst_comment,
+            "trust_score": trust_score,
+        }
+
+    # ── Upsert into Qdrant ──
     try:
         qdrant.upsert(  # type: ignore[union-attr]
             collection_name=COLLECTION_NAME,
@@ -378,11 +481,7 @@ async def submit_feedback(req: FeedbackRequest):
                 PointStruct(
                     id=point_id,
                     vector=vector,
-                    payload={
-                        "raw_log": req.raw_log,
-                        "label": req.label,
-                        "analyst_comment": req.analyst_comment,
-                    },
+                    payload=payload,
                 )
             ],
         )
@@ -393,5 +492,10 @@ async def submit_feedback(req: FeedbackRequest):
             detail=f"Vector DB write failed: {exc}",
         ) from exc
 
-    logger.info("Feedback stored — point_id=%s", point_id)
-    return FeedbackResponse(status="stored", point_id=point_id)
+    logger.info("Feedback stored — point_id=%s, action=%s, trust_score=%d", point_id, action, trust_score)
+    return FeedbackResponse(
+        status="stored",
+        point_id=point_id,
+        action=action,
+        trust_score=trust_score,
+    )
