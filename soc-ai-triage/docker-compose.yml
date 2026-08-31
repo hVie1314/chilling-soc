@@ -1,4 +1,3 @@
-version: "3.9"
 
 # ─────────────────────────────────────────────────────────────
 # SOC AI Triage System – Docker Compose
@@ -16,7 +15,7 @@ services:
     volumes:
       - ./qdrant_data:/qdrant/storage
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:6333/healthz || exit 1"]
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/6333' || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -25,8 +24,9 @@ services:
       - soc-net
     restart: unless-stopped
 
-  # ── 2. vLLM serving Foundation-Sec-8B ──────────────────────
+  # ── 2. vLLM serving Foundation-Sec-8B (production only) ──────
   llm-engine:
+    profiles: ["prod"]
     image: vllm/vllm-openai:latest
     container_name: soc-llm-engine
     ports:
@@ -73,14 +73,13 @@ services:
     environment:
       - QDRANT_HOST=vector-db
       - QDRANT_PORT=6333
-      - LLM_BASE_URL=http://llm-engine:8000/v1
-      - COLLECTION_NAME=soc_knowledge_base
-      - EMBEDDING_MODEL=nomic-ai/nomic-embed-text-v1.5
+      - LLM_BASE_URL=${LLM_BASE_URL:-http://llm-engine:8000/v1}
+      - LLM_MODEL=${LLM_MODEL:-fdtn-ai/Foundation-Sec-8B}
+      - COLLECTION_NAME=${COLLECTION_NAME:-soc_knowledge_base}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-nomic-ai/nomic-embed-text-v1.5}
       - LOG_LEVEL=info
     depends_on:
       vector-db:
-        condition: service_healthy
-      llm-engine:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]

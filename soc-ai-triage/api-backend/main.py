@@ -9,6 +9,7 @@ Responsibilities:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -36,6 +37,7 @@ from sentence_transformers import SentenceTransformer
 QDRANT_HOST: str = os.getenv("QDRANT_HOST", "localhost")
 QDRANT_PORT: int = int(os.getenv("QDRANT_PORT", "6333"))
 LLM_BASE_URL: str = os.getenv("LLM_BASE_URL", "http://localhost:8000/v1")
+LLM_MODEL: str = os.getenv("LLM_MODEL", "fdtn-ai/Foundation-Sec-8B")
 COLLECTION_NAME: str = os.getenv("COLLECTION_NAME", "soc_knowledge_base")
 EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "nomic-ai/nomic-embed-text-v1.5")
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "info").upper()
@@ -107,9 +109,9 @@ async def lifespan(application: FastAPI):  # noqa: ARG001
     qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, timeout=30)
     _ensure_collection(qdrant)
 
-    # ── vLLM OpenAI-compatible async client ──
+    # ── OpenAI-compatible async client (works with vLLM, Ollama, etc.) ──
     llm_client = AsyncOpenAI(base_url=LLM_BASE_URL, api_key="not-needed")
-    logger.info("LLM client initialised (base_url=%s).", LLM_BASE_URL)
+    logger.info("LLM client initialised (base_url=%s, model=%s).", LLM_BASE_URL, LLM_MODEL)
 
     yield  # application runs
 
@@ -248,8 +250,25 @@ def _parse_llm_response(content: str) -> TriageResult:
 
 @app.get("/health", tags=["ops"])
 async def health_check():
-    """Liveness / readiness probe."""
-    return {"status": "healthy"}
+    """Liveness / readiness probe with optional dependency checks."""
+    health = {"status": "healthy"}
+
+    # Qdrant check
+    try:
+        qdrant.get_collection(COLLECTION_NAME)  # type: ignore[union-attr]
+        health["qdrant"] = "connected"
+    except Exception:
+        health["qdrant"] = "unreachable"
+
+    # LLM check (non-blocking, informational — 3s timeout)
+    try:
+        models = await asyncio.wait_for(llm_client.models.list(), timeout=3.0)  # type: ignore[union-attr]
+        health["llm"] = "connected"
+        health["llm_models"] = [m.id for m in models.data]  # type: ignore[union-attr]
+    except Exception:
+        health["llm"] = "unreachable"
+
+    return health
 
 
 @app.post(
@@ -262,7 +281,7 @@ async def analyze_log(req: AnalyzeRequest):
     """
     1. Embed the raw log.
     2. Retrieve top-2 similar past cases from Qdrant (RAG).
-    3. Construct a prompt and call the LLM via vLLM's Chat Completions API.
+    3. Construct a prompt and call the LLM via OpenAI-compatible Chat Completions API.
     4. Parse the structured JSON verdict and return it.
     """
     logger.info("Received /analyze request (%d chars).", len(req.raw_log))
@@ -277,35 +296,51 @@ async def analyze_log(req: AnalyzeRequest):
     # Step 3 – build prompt
     messages = _build_prompt(req.raw_log, similar_cases)
 
-    # Step 4 – call LLM with JSON mode (guided decoding)
+    # Step 4 – call LLM
+    # Try with guided_json (vLLM structured output) first;
+    # fall back to plain JSON-mode request for providers that don't support it (e.g. Ollama).
+    guided_json_schema = json.dumps(
+        {
+            "type": "object",
+            "properties": {
+                "result": {
+                    "type": "string",
+                    "enum": ["FP", "TP", "Incident"],
+                },
+                "reason": {"type": "string"},
+            },
+            "required": ["result", "reason"],
+        }
+    )
+
+    chat_response = None
     try:
+        # Attempt with vLLM guided decoding
         chat_response = await llm_client.chat.completions.create(  # type: ignore[union-attr]
-            model="fdtn-ai/Foundation-Sec-8B",
+            model=LLM_MODEL,
             messages=messages,
             temperature=0.1,
             max_tokens=256,
-            extra_body={
-                "guided_json": json.dumps(
-                    {
-                        "type": "object",
-                        "properties": {
-                            "result": {
-                                "type": "string",
-                                "enum": ["FP", "TP", "Incident"],
-                            },
-                            "reason": {"type": "string"},
-                        },
-                        "required": ["result", "reason"],
-                    }
-                )
-            },
+            extra_body={"guided_json": guided_json_schema},
         )
-    except Exception as exc:
-        logger.exception("LLM call failed.")
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"LLM engine unreachable or returned error: {exc}",
-        ) from exc
+    except Exception as guided_exc:
+        logger.warning(
+            "LLM call with guided_json failed (%s); retrying without it.",
+            type(guided_exc).__name__,
+        )
+        try:
+            chat_response = await llm_client.chat.completions.create(  # type: ignore[union-attr]
+                model=LLM_MODEL,
+                messages=messages,
+                temperature=0.1,
+                max_tokens=256,
+            )
+        except Exception as plain_exc:
+            logger.exception("LLM call failed.")
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"LLM engine unreachable or returned error: {plain_exc}",
+            ) from plain_exc
 
     raw_content = chat_response.choices[0].message.content or ""
     logger.debug("LLM raw response: %s", raw_content[:500])

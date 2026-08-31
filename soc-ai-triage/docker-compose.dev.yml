@@ -1,0 +1,17 @@
+# ─────────────────────────────────────────────────────────────
+# SOC AI Triage System – Development Override
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build -d
+#
+# Ollama must be running on the Windows host:
+#   ollama run hf.co/fdtn-ai/Foundation-Sec-8B-Q4_K_M-GGUF:Q4_K_M
+# ─────────────────────────────────────────────────────────────
+
+services:
+  api-backend:
+    environment:
+      - LLM_BASE_URL=http://host.docker.internal:11434/v1
+      - LLM_MODEL=Foundation-Sec-8B-local
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
