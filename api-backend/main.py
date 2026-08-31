@@ -1,10 +1,13 @@
 """
-SOC AI Triage System — FastAPI Backend (Orchestrator)
+SOC AI Triage System — FastAPI Backend (Orchestrator) v3.0
 
 Responsibilities:
-  • POST /analyze  – Embed events → RAG lookup → LLM triage → return JSON verdict
-  • POST /feedback – Embed log → gradual trust upsert into Qdrant
-  • GET  /health   – Liveness probe
+  • POST /analyze           – Embed events → RAG lookup → LLM triage → action routing → return JSON verdict
+  • POST /feedback          – Embed log → gradual trust upsert into Qdrant
+  • POST /webhook/feedback  – External Case Management webhook → gradual trust ingestion
+  • GET  /health            – Liveness probe
+
+Labels (unified):  TruePositive | FalsePositive | Benign | Suspicious
 """
 
 from __future__ import annotations
@@ -15,8 +18,10 @@ import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
-from typing import Literal
+from datetime import datetime, timezone
+from typing import Literal, Optional
 
+import aiosqlite
 import numpy as np
 # pyrefly: ignore [missing-import]
 from fastapi import FastAPI, HTTPException, status
@@ -46,30 +51,39 @@ EMBEDDING_DIM: int = 768  # nomic-embed-text-v1.5 output dimension
 SIMILARITY_THRESHOLD: float = 0.92  # Threshold for feedback deduplication
 MAX_TRUST_SCORE: int = 5
 
+# SQLite state bridge
+DB_PATH: str = os.getenv("SQLITE_DB_PATH", "/app/data/soc_triage.db")
+
+# Unified label set (Case Management verdicts)
+VALID_LABELS = {"TruePositive", "FalsePositive", "Benign", "Suspicious"}
+
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(name)s — %(message)s")
 logger = logging.getLogger("soc-api")
 
 # ───────────────────────── Pydantic Models ───────────────────────
 
+UnifiedLabel = Literal["TruePositive", "FalsePositive", "Benign", "Suspicious"]
+
+
 class AnalyzeRequest(BaseModel):
-    alert_id: str = Field(default="web-dummy", description="Alert identifier")
+    alert_id: str = Field(default="default-alert", description="Alert identifier")
     events: list[str] = Field(..., min_length=1, description="List of raw event log entries")
 
 
 class TriageResult(BaseModel):
-    result: Literal["FP", "TP", "Incident"]
+    result: UnifiedLabel
     reason: str
 
 
 class AnalyzeResponse(BaseModel):
-    result: Literal["FP", "TP", "Incident"]
+    result: UnifiedLabel
     reason: str
     similar_cases: list[dict] = Field(default_factory=list, description="RAG-retrieved past cases")
 
 
 class FeedbackRequest(BaseModel):
     raw_log: str = Field(..., min_length=1, description="Raw log entry to store feedback for")
-    label: Literal["FP", "TP", "Incident"]
+    label: UnifiedLabel
     analyst_comment: str = Field(default="", description="Analyst comment for the feedback")
 
 
@@ -78,6 +92,21 @@ class FeedbackResponse(BaseModel):
     point_id: str
     action: str = Field(default="inserted", description="'inserted', 'reinforced', or 'corrected'")
     trust_score: int = Field(default=1)
+
+
+class WebhookFeedbackRequest(BaseModel):
+    event: str = Field(default="", description="Event log text (optional context)")
+    feedback_id: str = Field(default="", description="External feedback identifier")
+    case_id: str = Field(..., description="Matches alert_id in the cases table")
+    user_id: str = Field(default="", description="External user identifier")
+    verdict: UnifiedLabel
+    comment: str = Field(default="", description="Analyst comment")
+    created_at: str = Field(default="", description="ISO 8601 timestamp from external system")
+
+
+class WebhookResponse(BaseModel):
+    status: str
+
 
 # ───────────────────────── Global Resources ──────────────────────
 
@@ -100,6 +129,81 @@ def _ensure_collection(client: QdrantClient) -> None:
         logger.info("Collection '%s' created.", COLLECTION_NAME)
 
 
+# ───────────────────────── SQLite State Bridge ───────────────────
+
+async def _init_db() -> None:
+    """Create the SQLite database and cases table if they don't exist."""
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS cases (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                alert_id    TEXT    NOT NULL,
+                events_json TEXT    NOT NULL,
+                created_at  TEXT    NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_cases_alert_id ON cases (alert_id)
+        """)
+        await db.commit()
+    logger.info("SQLite database initialised at '%s'.", DB_PATH)
+
+
+async def _save_case(alert_id: str, events: list[str]) -> None:
+    """Persist an incoming alert to the SQLite cases table."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO cases (alert_id, events_json, created_at) VALUES (?, ?, ?)",
+            (alert_id, json.dumps(events, ensure_ascii=False), datetime.now(timezone.utc).isoformat()),
+        )
+        await db.commit()
+    logger.info("Saved case to SQLite — alert_id=%s", alert_id)
+
+
+async def _get_events_by_alert_id(alert_id: str) -> list[str] | None:
+    """Retrieve the original events for a given alert_id from SQLite."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT events_json FROM cases WHERE alert_id = ? ORDER BY id DESC LIMIT 1",
+            (alert_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return json.loads(row["events_json"])
+    return None
+
+
+# ───────────────────────── Action Routing Scaffolding ─────────────
+
+async def dispatch_to_case_management(alert_id: str, events: list, reason: str) -> None:
+    """
+    Stub: Dispatch alert to Case Management system for investigation.
+    In production, this would POST to a SOAR / Case Management API.
+    """
+    logger.info(
+        "[ACTION] Dispatching to Case Management — alert_id=%s, events=%d, reason=%s",
+        alert_id, len(events), reason[:120],
+    )
+
+
+async def trigger_soar_edge_extension_close(alert_id: str, reason: str) -> None:
+    """
+    Stub: Trigger SOAR edge extension to auto-close the alert.
+    In production, this would call a SOAR API to close/dismiss the alert.
+    """
+    logger.info(
+        "[ACTION] Triggering SOAR auto-close — alert_id=%s, reason=%s",
+        alert_id, reason[:120],
+    )
+
+
+# ───────────────────────── Lifespan ──────────────────────────────
+
 @asynccontextmanager
 async def lifespan(application: FastAPI):  # noqa: ARG001
     """Startup / shutdown lifecycle hook."""
@@ -119,6 +223,9 @@ async def lifespan(application: FastAPI):  # noqa: ARG001
     llm_client = AsyncOpenAI(base_url=LLM_BASE_URL, api_key="not-needed")
     logger.info("LLM client initialised (base_url=%s, model=%s).", LLM_BASE_URL, LLM_MODEL)
 
+    # ── SQLite state bridge ──
+    await _init_db()
+
     yield  # application runs
 
     # ── Cleanup ──
@@ -131,7 +238,7 @@ async def lifespan(application: FastAPI):  # noqa: ARG001
 app = FastAPI(
     title="SOC AI Triage API",
     description="Security Operations Center – AI-powered log triage with RAG feedback loop",
-    version="2.0.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
@@ -190,15 +297,16 @@ def _build_prompt(events: list[str], similar_cases: list[dict]) -> list[dict]:
     """
     Build the Chat Completions messages list for multi-event alerts.
     Includes trust-aware RAG context and strict Vietnamese output instructions.
+    Uses unified labels: TruePositive, FalsePositive, Benign, Suspicious.
     """
     system_content = (
         "You are a senior SOC analyst AI. Your task is to triage a security alert containing one or more event logs.\n"
         "STRICT RULES:\n"
-        "1. Output ONLY a valid JSON object: {\"result\": \"FP\" | \"TP\" | \"Incident\", \"reason\": \"<Vietnamese explanation>\"}\n"
-        "2. If ANY event in the alert is malicious, the whole result MUST be TP or Incident.\n"
-        "3. The 'reason' MUST be written in Vietnamese.\n"
-        "4. The 'reason' MUST be concise (maximum 1-2 sentences). "
-        "If a TP or malicious event exists, do NOT explain FP logs; only explain the malicious event.\n"
+        '1. Output ONLY a valid JSON object: {"result": "<label>", "reason": "<Vietnamese explanation>"}\n'
+        "2. The <label> MUST be exactly one of: TruePositive, FalsePositive, Benign, Suspicious.\n"
+        "3. If ANY event in the alert is malicious, the whole result MUST be TruePositive or Suspicious.\n"
+        "4. The 'reason' MUST be written in Vietnamese and be concise (maximum 1-2 sentences). "
+        "If a malicious event exists, only explain the most malicious event.\n"
         "5. Do NOT include any text outside the JSON object.\n"
     )
 
@@ -212,7 +320,7 @@ def _build_prompt(events: list[str], similar_cases: list[dict]) -> list[dict]:
             label = case.get("label", "?")
             comment = case.get("comment", "")
             user_parts.append(
-                f"- Log pattern matched. Analyst labelled as [{label}] "
+                f"- Analyst labelled as [{label}] "
                 f"with Trust Score [{trust}/{MAX_TRUST_SCORE}]. "
                 f"Comment: [{comment}]"
             )
@@ -255,11 +363,118 @@ def _parse_llm_response(content: str) -> TriageResult:
     result_val = data.get("result", "").strip()
     reason_val = data.get("reason", "No reason provided.").strip()
 
-    if result_val not in {"FP", "TP", "Incident"}:
-        logger.warning("LLM returned unexpected result value: '%s'. Defaulting to TP.", result_val)
-        result_val = "TP"
+    if result_val not in VALID_LABELS:
+        logger.warning("LLM returned unexpected result value: '%s'. Defaulting to Suspicious.", result_val)
+        result_val = "Suspicious"
 
     return TriageResult(result=result_val, reason=reason_val)
+
+
+# ───────────────────────── Gradual Trust Logic ───────────────────
+
+async def _apply_gradual_trust(
+    raw_log: str,
+    label: str,
+    comment: str,
+) -> FeedbackResponse:
+    """
+    Core gradual trust logic — shared by /feedback and /webhook/feedback.
+    Embed the raw log, query Qdrant for near-duplicates, and insert/reinforce/correct.
+    """
+    vector = _embed(raw_log)
+
+    # ── Query Qdrant for top-1 match to check for near-duplicate ──
+    existing_match = None
+    try:
+        collection_info = qdrant.get_collection(COLLECTION_NAME)  # type: ignore[union-attr]
+        if collection_info.points_count > 0:
+            hits = qdrant.search(  # type: ignore[union-attr]
+                collection_name=COLLECTION_NAME,
+                query_vector=vector,
+                limit=1,
+                with_payload=True,
+            )
+            if hits and hits[0].score > SIMILARITY_THRESHOLD:
+                existing_match = hits[0]
+                logger.info(
+                    "Found existing match (score=%.4f, id=%s, label=%s).",
+                    existing_match.score, existing_match.id,
+                    (existing_match.payload or {}).get("label", "?"),
+                )
+    except Exception:
+        logger.exception("Qdrant search during feedback failed — will insert as new.")
+
+    # ── Determine action: insert / reinforce / correct ──
+    if existing_match is None:
+        # No close match → INSERT new point
+        point_id = str(uuid.uuid4())
+        trust_score = 1
+        action = "inserted"
+        payload = {
+            "raw_log": raw_log,
+            "label": label,
+            "comment": comment,
+            "trust_score": trust_score,
+        }
+        logger.info("No close match — inserting new point (id=%s).", point_id)
+    else:
+        # Reuse the existing point's ID to avoid duplicates
+        point_id = str(existing_match.id)
+        existing_payload = existing_match.payload or {}
+        existing_label = existing_payload.get("label", "")
+        existing_trust = existing_payload.get("trust_score", 1)
+
+        if existing_label == label:
+            # Same label → REINFORCE: increment trust, update comment
+            trust_score = min(existing_trust + 1, MAX_TRUST_SCORE)
+            action = "reinforced"
+            logger.info(
+                "Same label — reinforcing (trust_score %d → %d).",
+                existing_trust, trust_score,
+            )
+        else:
+            # Different label → CORRECT: overwrite label, reset trust
+            trust_score = 1
+            action = "corrected"
+            logger.info(
+                "Label conflict (%s → %s) — correcting, trust reset to 1.",
+                existing_label, label,
+            )
+
+        payload = {
+            "raw_log": raw_log,
+            "label": label,
+            "comment": comment,
+            "trust_score": trust_score,
+        }
+
+    # ── Upsert into Qdrant ──
+    try:
+        qdrant.upsert(  # type: ignore[union-attr]
+            collection_name=COLLECTION_NAME,
+            points=[
+                PointStruct(
+                    id=point_id,
+                    vector=vector,
+                    payload=payload,
+                )
+            ],
+        )
+    except Exception as exc:
+        logger.exception("Qdrant upsert failed.")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Vector DB write failed: {exc}",
+        ) from exc
+
+    logger.info("Feedback stored — point_id=%s, action=%s, trust_score=%d", point_id, action, trust_score)
+    return FeedbackResponse(
+        status="stored",
+        point_id=point_id,
+        action=action,
+        trust_score=trust_score,
+    )
+
 
 # ───────────────────────── Endpoints ─────────────────────────────
 
@@ -283,6 +498,16 @@ async def health_check():
     except Exception:
         health["llm"] = "unreachable"
 
+    # SQLite check
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT COUNT(*) FROM cases") as cursor:
+                row = await cursor.fetchone()
+                health["sqlite"] = "connected"
+                health["sqlite_cases_count"] = row[0] if row else 0
+    except Exception:
+        health["sqlite"] = "unreachable"
+
     return health
 
 
@@ -294,15 +519,24 @@ async def health_check():
 )
 async def analyze_log(req: AnalyzeRequest):
     """
-    1. Iterate through events, embed each unique event.
-    2. Query Qdrant per event and aggregate RAG context (deduplicated).
-    3. Construct a multi-event prompt and call the LLM.
-    4. Parse the structured JSON verdict and return it.
+    1. Save alert to SQLite state bridge.
+    2. Iterate through events, embed each unique event.
+    3. Query Qdrant per event and aggregate RAG context (deduplicated).
+    4. Construct a multi-event prompt and call the LLM.
+    5. Parse the structured JSON verdict.
+    6. Route action based on verdict.
+    7. Return result.
     """
     logger.info(
         "Received /analyze request — alert_id=%s, %d event(s).",
         req.alert_id, len(req.events),
     )
+
+    # Step 0 – persist to SQLite BEFORE analysis
+    try:
+        await _save_case(req.alert_id, req.events)
+    except Exception:
+        logger.exception("Failed to save case to SQLite — continuing with analysis.")
 
     # Step 1 & 2 – embed each unique event and aggregate RAG results
     seen_events: set[str] = set()
@@ -341,7 +575,7 @@ async def analyze_log(req: AnalyzeRequest):
             "properties": {
                 "result": {
                     "type": "string",
-                    "enum": ["FP", "TP", "Incident"],
+                    "enum": ["TruePositive", "FalsePositive", "Benign", "Suspicious"],
                 },
                 "reason": {"type": "string"},
             },
@@ -384,6 +618,15 @@ async def analyze_log(req: AnalyzeRequest):
     # Step 5 – parse
     triage = _parse_llm_response(raw_content)
 
+    # Step 6 – action routing
+    try:
+        if triage.result in ("TruePositive", "Suspicious"):
+            await dispatch_to_case_management(req.alert_id, req.events, triage.reason)
+        elif triage.result in ("FalsePositive", "Benign"):
+            await trigger_soar_edge_extension_close(req.alert_id, triage.reason)
+    except Exception:
+        logger.exception("Action routing failed — verdict still returned to caller.")
+
     return AnalyzeResponse(
         result=triage.result,
         reason=triage.reason,
@@ -405,97 +648,59 @@ async def submit_feedback(req: FeedbackRequest):
       - Close match, different label: CORRECT — overwrite label & comment, reset trust_score=1.
     """
     logger.info("Received /feedback — label=%s, comment=%s", req.label, req.analyst_comment[:80])
+    return await _apply_gradual_trust(req.raw_log, req.label, req.analyst_comment)
 
-    vector = _embed(req.raw_log)
 
-    # ── Query Qdrant for top-1 match to check for near-duplicate ──
-    existing_match = None
-    try:
-        collection_info = qdrant.get_collection(COLLECTION_NAME)  # type: ignore[union-attr]
-        if collection_info.points_count > 0:
-            hits = qdrant.search(  # type: ignore[union-attr]
-                collection_name=COLLECTION_NAME,
-                query_vector=vector,
-                limit=1,
-                with_payload=True,
-            )
-            if hits and hits[0].score > SIMILARITY_THRESHOLD:
-                existing_match = hits[0]
-                logger.info(
-                    "Found existing match (score=%.4f, id=%s, label=%s).",
-                    existing_match.score, existing_match.id,
-                    (existing_match.payload or {}).get("label", "?"),
-                )
-    except Exception:
-        logger.exception("Qdrant search during feedback failed — will insert as new.")
+@app.post(
+    "/webhook/feedback",
+    response_model=WebhookResponse,
+    tags=["webhook"],
+    summary="Receive external Case Management feedback via webhook",
+    status_code=status.HTTP_200_OK,
+)
+async def webhook_feedback(req: WebhookFeedbackRequest):
+    """
+    Ingest feedback from an external Case Management / SOAR system.
 
-    # ── Determine action: insert / reinforce / correct ──
-    if existing_match is None:
-        # No close match → INSERT new point
-        point_id = str(uuid.uuid4())
-        trust_score = 1
-        action = "inserted"
-        payload = {
-            "raw_log": req.raw_log,
-            "label": req.label,
-            "comment": req.analyst_comment,
-            "trust_score": trust_score,
-        }
-        logger.info("No close match — inserting new point (id=%s).", point_id)
-    else:
-        # Reuse the existing point's ID to avoid duplicates
-        point_id = str(existing_match.id)
-        existing_payload = existing_match.payload or {}
-        existing_label = existing_payload.get("label", "")
-        existing_trust = existing_payload.get("trust_score", 1)
-
-        if existing_label == req.label:
-            # Same label → REINFORCE: increment trust, update comment
-            trust_score = min(existing_trust + 1, MAX_TRUST_SCORE)
-            action = "reinforced"
-            logger.info(
-                "Same label — reinforcing (trust_score %d → %d).",
-                existing_trust, trust_score,
-            )
-        else:
-            # Different label → CORRECT: overwrite label, reset trust
-            trust_score = 1
-            action = "corrected"
-            logger.info(
-                "Label conflict (%s → %s) — correcting, trust reset to 1.",
-                existing_label, req.label,
-            )
-
-        payload = {
-            "raw_log": req.raw_log,
-            "label": req.label,
-            "comment": req.analyst_comment,
-            "trust_score": trust_score,
-        }
-
-    # ── Upsert into Qdrant ──
-    try:
-        qdrant.upsert(  # type: ignore[union-attr]
-            collection_name=COLLECTION_NAME,
-            points=[
-                PointStruct(
-                    id=point_id,
-                    vector=vector,
-                    payload=payload,
-                )
-            ],
-        )
-    except Exception as exc:
-        logger.exception("Qdrant upsert failed.")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Vector DB write failed: {exc}",
-        ) from exc
-
-    logger.info("Feedback stored — point_id=%s, action=%s, trust_score=%d", point_id, action, trust_score)
-    return FeedbackResponse(
-        status="stored",
-        point_id=point_id,
-        action=action,
-        trust_score=trust_score,
+    1. Look up the original events from SQLite using case_id (== alert_id).
+    2. If not found, log a warning and return 200 OK.
+    3. If found, run the gradual trust logic on each original event.
+    4. Always return HTTP 200 {"status": "received"}.
+    """
+    logger.info(
+        "Received /webhook/feedback — case_id=%s, verdict=%s, user_id=%s",
+        req.case_id, req.verdict, req.user_id,
     )
+
+    # Step 1 – retrieve original events from SQLite
+    events = await _get_events_by_alert_id(req.case_id)
+
+    if events is None:
+        logger.warning(
+            "Webhook: No case found for case_id=%s in SQLite. "
+            "Acknowledging without processing.",
+            req.case_id,
+        )
+        return WebhookResponse(status="received")
+
+    # Step 2 – apply gradual trust for each original event
+    for event in events:
+        event_stripped = event.strip()
+        if not event_stripped:
+            continue
+        try:
+            await _apply_gradual_trust(event_stripped, req.verdict, req.comment)
+        except HTTPException:
+            # Qdrant write failures — log but don't fail the webhook
+            logger.exception(
+                "Gradual trust upsert failed for event in case_id=%s, skipping.",
+                req.case_id,
+            )
+        except Exception:
+            logger.exception(
+                "Unexpected error during gradual trust for case_id=%s, skipping.",
+                req.case_id,
+            )
+
+    logger.info("Webhook processed — case_id=%s, %d event(s) updated.", req.case_id, len(events))
+    return WebhookResponse(status="received")

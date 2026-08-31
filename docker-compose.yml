@@ -70,6 +70,8 @@ services:
     container_name: soc-api-backend
     ports:
       - "8080:8080"
+    volumes:
+      - ./sqlite_data:/app/data
     environment:
       - QDRANT_HOST=vector-db
       - QDRANT_PORT=6333
@@ -77,6 +79,7 @@ services:
       - LLM_MODEL=${LLM_MODEL:-fdtn-ai/Foundation-Sec-8B}
       - COLLECTION_NAME=${COLLECTION_NAME:-soc_knowledge_base}
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-nomic-ai/nomic-embed-text-v1.5}
+      - SQLITE_DB_PATH=/app/data/soc_triage.db
       - LOG_LEVEL=info
     depends_on:
       vector-db:
