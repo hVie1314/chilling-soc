@@ -1,12 +1,15 @@
 """
-SOC AI Triage System — Streamlit Web Interface v3.0
+SOC AI Triage System — Streamlit Web Interface v4.0
 
-Professional 3-tab cybersecurity dashboard:
-  • Tab 1 — 🎯 Triage Hub:  Multi-event analysis, verdict display, analyst feedback
-  • Tab 2 — 📊 Analytics:   Placeholder stats & charts
-  • Tab 3 — ⚙️ System Config: Environment settings & health check
+Implements io-routing-spec.md v1.0.0 in full:
+  • Tab 1 — 🎯 Triage Hub:    Multi-event analysis, verdict display (with ActionReceipt banners),
+                               and analyst feedback submission.
+  • Tab 2 — 📊 Analytics:     Session-level verdict counters and distribution chart.
+  • Tab 3 — ⚙️ System Config:  Persistent I/O routing matrix (source × destination toggles),
+                               secure destination credentials synced via PUT /config.
 
 Uses unified labels: TruePositive | FalsePositive | Benign | Suspicious
+Input source declared: "web_ui"
 """
 
 from __future__ import annotations
@@ -21,8 +24,10 @@ import streamlit as st
 
 API_URL: str = os.getenv("API_BACKEND_URL", "http://localhost:8080")
 REQUEST_TIMEOUT: float = 120.0  # LLM inference can be slow
+CONFIG_TIMEOUT: float = 10.0
 
 UNIFIED_LABELS = ["TruePositive", "FalsePositive", "Benign", "Suspicious"]
+AUTH_TYPES = ["none", "bearer", "api_key", "basic"]
 
 # ───────────────────────── Page Setup ────────────────────────────
 
@@ -109,6 +114,15 @@ st.markdown(
         opacity: 0.6;
     }
 
+    /* ── Routing policy card ────────────────────────────── */
+    .routing-card {
+        background: rgba(255,255,255,0.03);
+        border: 1px solid rgba(255,255,255,0.10);
+        border-radius: 16px;
+        padding: 20px 24px;
+        margin-bottom: 8px;
+    }
+
     /* ── Header ─────────────────────────────────────────── */
     .main-header {
         font-size: 2rem;
@@ -154,6 +168,8 @@ if "analyzed_events" not in st.session_state:
     st.session_state.analyzed_events = []
 if "similar_cases" not in st.session_state:
     st.session_state.similar_cases = []
+if "actions_dispatched" not in st.session_state:
+    st.session_state.actions_dispatched = []
 if "alert_id" not in st.session_state:
     st.session_state.alert_id = "default-alert"
 
@@ -162,12 +178,6 @@ if "stats_total" not in st.session_state:
     st.session_state.stats_total = 0
 if "stats_verdicts" not in st.session_state:
     st.session_state.stats_verdicts = {label: 0 for label in UNIFIED_LABELS}
-
-# System config
-if "cfg_webhook_url" not in st.session_state:
-    st.session_state.cfg_webhook_url = ""
-if "cfg_soar_api_url" not in st.session_state:
-    st.session_state.cfg_soar_api_url = ""
 
 # ───────────────────────── Sidebar ───────────────────────────────
 
@@ -200,7 +210,8 @@ with st.sidebar:
         "1. Paste raw log event(s) (one per line)\n"
         "2. AI triages as **TruePositive**, **FalsePositive**, **Benign**, or **Suspicious**\n"
         "3. Review & correct the verdict\n"
-        "4. Your feedback trains future analysis"
+        "4. Your feedback trains future analysis\n"
+        "5. Configure routing policies in **System Config**"
     )
 
 # ───────────────────────── Helpers ───────────────────────────────
@@ -220,11 +231,78 @@ def _badge_class(verdict: str) -> str:
     }.get(verdict, "badge-suspicious")
 
 
+def _fetch_config() -> dict:
+    """
+    Load SystemSettings from the backend GET /config endpoint.
+    Returns an empty dict on failure; the UI will render defaults.
+    """
+    try:
+        resp = httpx.get(f"{API_URL}/config", timeout=CONFIG_TIMEOUT)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception as e:
+        st.warning(f"Could not load config from backend: {e}", icon="⚠️")
+    return {}
+
+
+def _render_action_receipts(actions: list[dict]) -> None:
+    """
+    Render the actions_dispatched list from an AnalyzeResponse.
+    Shows distinct banners per destination and status.
+    """
+    if not actions:
+        return
+
+    st.divider()
+    st.subheader("🚀 Dispatch Actions")
+
+    for act in actions:
+        dest = act.get("destination", "unknown")
+        act_status = act.get("status", "unknown")
+        details = act.get("details", "")
+        error = act.get("error", "")
+        http_code = act.get("http_status")
+        ts = act.get("timestamp", "")
+
+        dest_label = {
+            "case_management": "📋 Case Management",
+            "soar_edge": "⚡ SOAR Edge",
+            "all": "🌐 All Systems",
+        }.get(dest, f"📡 {dest}")
+
+        if act_status == "success":
+            code_info = f" (HTTP {http_code})" if http_code else ""
+            msg = f"{dest_label} → **Dispatched successfully**{code_info}"
+            if details:
+                msg += f"\n\n> {details}"
+            st.success(msg, icon="✅")
+
+        elif act_status == "skipped":
+            msg = f"{dest_label} → **Skipped**: {details or 'No URL configured'}"
+            st.info(msg, icon="ℹ️")
+
+        elif act_status == "dry_run_skipped":
+            st.warning(
+                f"**Dry-Run Mode Active** — {details or 'No external systems were contacted.'}",
+                icon="🔒",
+            )
+
+        elif act_status == "failed":
+            code_info = f" (HTTP {http_code})" if http_code else ""
+            msg = f"{dest_label} → **Dispatch FAILED**{code_info}"
+            if error:
+                msg += f"\n\n> Error: `{error}`"
+            st.error(msg, icon="🚨")
+
+        else:
+            st.caption(f"{dest_label} → status: `{act_status}`  |  {ts[:19]}")
+
+
 # ───────────────────────── Main Header ───────────────────────────
 
 st.markdown('<p class="main-header">🛡️ SOC AI Triage</p>', unsafe_allow_html=True)
 st.markdown(
-    '<p class="sub-header">AI-powered security log triage with analyst feedback loop · v3.0</p>',
+    '<p class="sub-header">AI-powered security log triage with analyst feedback loop · v4.0</p>',
     unsafe_allow_html=True,
 )
 
@@ -277,6 +355,8 @@ with tab_triage:
                         json={
                             "alert_id": alert_id_input or "default-alert",
                             "events": events,
+                            # Spec §4.1: Web UI must declare its source
+                            "source": "web_ui",
                         },
                         timeout=REQUEST_TIMEOUT,
                     )
@@ -287,6 +367,8 @@ with tab_triage:
                     st.session_state.analyzed_events = events
                     st.session_state.alert_id = alert_id_input or "default-alert"
                     st.session_state.similar_cases = data.get("similar_cases", [])
+                    # Spec §4.1: Capture actions_dispatched for receipt rendering
+                    st.session_state.actions_dispatched = data.get("actions_dispatched", [])
 
                     # Update analytics counters
                     verdict = data.get("result", "")
@@ -328,6 +410,9 @@ with tab_triage:
         # ── Raw JSON ─────────────────────────────────────────────
         with st.expander("🔧 Raw JSON Response"):
             st.json(result)
+
+        # ── Action Receipts (Spec §4.1) ──────────────────────────
+        _render_action_receipts(st.session_state.actions_dispatched)
 
         # ── Similar Cases (RAG) ──────────────────────────────────
         cases = st.session_state.similar_cases
@@ -482,19 +567,18 @@ with tab_analytics:
 
 # ═══════════════════════════════════════════════════════════════
 # TAB 3: SYSTEM CONFIG
+# Implements io-routing-spec.md §6 in full.
+# Settings are PERSISTED to backend via PUT /config (not session-only).
 # ═══════════════════════════════════════════════════════════════
 with tab_config:
     st.subheader("⚙️ System Configuration")
-    st.caption("Configure integration endpoints. Changes are stored in session only.")
+    st.caption(
+        "Manage I/O routing policies and integration credentials. "
+        "Changes are persisted to the backend SQLite database — they survive page reloads and container restarts."
+    )
 
-    st.divider()
-
-    # ── Current backend info ─────────────────────────────────────
-    st.markdown("### Backend Connection")
-    st.code(f"API_BACKEND_URL = {API_URL}", language="text")
-
-    # ── Health check detail ──────────────────────────────────────
-    st.markdown("### Service Health")
+    # ── Service Health ───────────────────────────────────────────
+    st.markdown("### 🔌 Service Health")
     try:
         resp = httpx.get(f"{API_URL}/health", timeout=5)
         if resp.status_code == 200:
@@ -532,31 +616,251 @@ with tab_config:
 
     st.divider()
 
-    # ── Integration endpoints ────────────────────────────────────
-    st.markdown("### Integration Endpoints")
+    # ── Load current config from backend ────────────────────────
+    # We load once per render cycle. The form will pre-populate from this.
+    current_cfg = _fetch_config()
 
+    # Deep-read helper with safe nested defaults
+    def _cfg(path: str, default=None):
+        """Navigate a dotted path into current_cfg dict safely."""
+        parts = path.split(".")
+        node = current_cfg
+        for p in parts:
+            if not isinstance(node, dict):
+                return default
+            node = node.get(p, default)
+            if node is None:
+                return default
+        return node
+
+    # ── Main Configuration Form ──────────────────────────────────
     with st.form("config_form"):
-        webhook_url = st.text_input(
-            "Webhook URL (Case Management)",
-            value=st.session_state.cfg_webhook_url,
-            placeholder="https://your-case-management.example.com/webhook",
-            help="URL where the system sends case management updates.",
-        )
-        soar_api_url = st.text_input(
-            "SOAR API URL",
-            value=st.session_state.cfg_soar_api_url,
-            placeholder="https://your-soar.example.com/api/v1",
-            help="SOAR platform API endpoint for auto-close actions.",
+
+        # ── Section 1: I/O Routing Matrix (Spec §6, item 1) ─────
+        st.markdown("### 🔀 I/O Routing Matrix")
+        st.caption(
+            "Define which downstream systems are activated per **input source** and **AI verdict**. "
+            "Human-in-the-loop safety: web_ui pushes are opt-in by default."
         )
 
+        routing_col1, routing_col2 = st.columns(2)
+
+        with routing_col1:
+            st.markdown(
+                '<div class="routing-card">'
+                '<strong>🌐 Web UI Source Rules</strong><br>'
+                '<small>Applies when an analyst manually submits logs via this interface.</small>'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+            web_enable_case_push = st.checkbox(
+                "📋 Push **TruePositive / Suspicious** to Case Management",
+                value=bool(_cfg("routing.web_source.enable_case_mgmt_push", False)),
+                help="When enabled, TruePositive and Suspicious verdicts from the Web UI will automatically POST to the Case Management webhook.",
+                key="web_case_push",
+            )
+            web_enable_soar_close = st.checkbox(
+                "⚡ Auto-close **FalsePositive / Benign** in SOAR",
+                value=bool(_cfg("routing.web_source.enable_soar_autoclose", False)),
+                help="When enabled, FalsePositive and Benign verdicts from the Web UI will trigger the SOAR auto-close API. Use with caution.",
+                key="web_soar_close",
+            )
+
+        with routing_col2:
+            st.markdown(
+                '<div class="routing-card">'
+                '<strong>🤖 SIEM / API Stream Rules</strong><br>'
+                '<small>Applies when alerts arrive automatically from a SIEM, EDR, or integration pipeline.</small>'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+            api_enable_case_push = st.checkbox(
+                "📋 Push **TruePositive / Suspicious** to Case Management",
+                value=bool(_cfg("routing.api_source.enable_case_mgmt_push", True)),
+                help="When enabled (default), alerts from SIEM pipelines that are TruePositive/Suspicious automatically create cases.",
+                key="api_case_push",
+            )
+            api_enable_soar_close = st.checkbox(
+                "⚡ Auto-close **FalsePositive / Benign** in SOAR",
+                value=bool(_cfg("routing.api_source.enable_soar_autoclose", True)),
+                help="When enabled (default), FalsePositive/Benign verdicts from SIEM pipelines trigger automatic SOAR dismissal.",
+                key="api_soar_close",
+            )
+
+        st.divider()
+
+        # ── Section 2: Global Controls (Spec §3.2 GlobalRoutingConfig) ──
+        st.markdown("### 🌍 Global Controls")
+
+        gcol1, gcol2 = st.columns([1, 2])
+        with gcol1:
+            global_dry_run = st.toggle(
+                "🔒 Master Dry-Run Mode",
+                value=bool(_cfg("routing.global.dry_run", False)),
+                help=(
+                    "**SAFE MODE**: When enabled, all routing decisions are evaluated but NO external API calls "
+                    "are made. The response will include 'dry_run_skipped' receipts. "
+                    "Disable only when integrations are fully tested."
+                ),
+                key="global_dry_run",
+            )
+        with gcol2:
+            if global_dry_run:
+                st.warning("⚠️ **Dry-Run Mode is ACTIVE** — no external systems will be contacted.", icon="🔒")
+            else:
+                st.info("Live mode — external dispatchers are active based on policies above.", icon="✅")
+
+        min_trust = st.slider(
+            "Minimum RAG Trust Score required for SOAR Auto-Close",
+            min_value=1,
+            max_value=5,
+            value=int(_cfg("routing.global.min_trust_score_for_autoclose", 1)),
+            help=(
+                "Analyst feedback entries with a trust score below this threshold will not influence "
+                "automatic SOAR close decisions. Raise this to require stronger consensus before auto-dismissal."
+            ),
+            key="min_trust_slider",
+        )
+
+        st.divider()
+
+        # ── Section 3: Destination Credentials (Spec §6, item 2) ─
+        st.markdown("### 🔐 Destination Credentials")
+
+        dest_col1, dest_col2 = st.columns(2)
+
+        with dest_col1:
+            st.markdown("**📋 Case Management**")
+            cm_url = st.text_input(
+                "Webhook URL",
+                value=_cfg("destinations.case_management.url", ""),
+                placeholder="https://your-case-management.example.com/api/alerts",
+                key="cm_url",
+            )
+            cm_auth_type = st.selectbox(
+                "Authentication Type",
+                options=AUTH_TYPES,
+                index=AUTH_TYPES.index(_cfg("destinations.case_management.auth_type", "none")),
+                key="cm_auth_type",
+            )
+            cm_api_key = st.text_input(
+                "API Key / Bearer Token",
+                value=_cfg("destinations.case_management.api_key", ""),
+                type="password",
+                placeholder="Paste your token here (stored securely in backend)",
+                key="cm_api_key",
+            )
+            cm_timeout = st.number_input(
+                "Timeout (seconds)",
+                min_value=1.0,
+                max_value=60.0,
+                value=float(_cfg("destinations.case_management.timeout_seconds", 10.0)),
+                step=1.0,
+                key="cm_timeout",
+            )
+
+        with dest_col2:
+            st.markdown("**⚡ SOAR Edge Extension**")
+            soar_url = st.text_input(
+                "API URL",
+                value=_cfg("destinations.soar_edge.url", ""),
+                placeholder="https://your-soar.example.com/api/v1/close",
+                key="soar_url",
+            )
+            soar_auth_type = st.selectbox(
+                "Authentication Type",
+                options=AUTH_TYPES,
+                index=AUTH_TYPES.index(_cfg("destinations.soar_edge.auth_type", "none")),
+                key="soar_auth_type",
+            )
+            soar_api_key = st.text_input(
+                "API Key / Bearer Token",
+                value=_cfg("destinations.soar_edge.api_key", ""),
+                type="password",
+                placeholder="Paste your token here (stored securely in backend)",
+                key="soar_api_key",
+            )
+            soar_timeout = st.number_input(
+                "Timeout (seconds)",
+                min_value=1.0,
+                max_value=60.0,
+                value=float(_cfg("destinations.soar_edge.timeout_seconds", 10.0)),
+                step=1.0,
+                key="soar_timeout",
+            )
+
+        st.divider()
+
+        # ── Save Button (Spec §6, item 3) ────────────────────────
         config_submitted = st.form_submit_button(
-            "💾  Save Configuration",
+            "💾  Save Configuration to Backend",
             type="primary",
             use_container_width=True,
         )
 
         if config_submitted:
-            st.session_state.cfg_webhook_url = webhook_url
-            st.session_state.cfg_soar_api_url = soar_api_url
-            st.success("Configuration saved to session.", icon="✅")
-            st.caption("Note: These values are stored in the browser session only and will reset on page reload.")
+            # Build the SystemSettings payload matching spec §3.2 Pydantic schema
+            new_settings = {
+                "routing": {
+                    "web_source": {
+                        "enable_case_mgmt_push": web_enable_case_push,
+                        "enable_soar_autoclose": web_enable_soar_close,
+                    },
+                    "api_source": {
+                        "enable_case_mgmt_push": api_enable_case_push,
+                        "enable_soar_autoclose": api_enable_soar_close,
+                    },
+                    # Note: we must use "global" as the key (aliased in Pydantic as global_)
+                    "global": {
+                        "dry_run": global_dry_run,
+                        "min_trust_score_for_autoclose": min_trust,
+                    },
+                },
+                "destinations": {
+                    "case_management": {
+                        "url": cm_url,
+                        "auth_type": cm_auth_type,
+                        "api_key": cm_api_key,
+                        "timeout_seconds": cm_timeout,
+                    },
+                    "soar_edge": {
+                        "url": soar_url,
+                        "auth_type": soar_auth_type,
+                        "api_key": soar_api_key,
+                        "timeout_seconds": soar_timeout,
+                    },
+                },
+            }
+
+            try:
+                put_resp = httpx.put(
+                    f"{API_URL}/config",
+                    json=new_settings,
+                    timeout=CONFIG_TIMEOUT,
+                )
+                put_resp.raise_for_status()
+                resp_data = put_resp.json()
+                updated_at = resp_data.get("updated_at", "")[:19].replace("T", " ")
+                st.success(
+                    f"✅ **Configuration persisted to backend SQLite**\n\n"
+                    f"Updated at: `{updated_at} UTC` — Settings survive page reloads and container restarts.",
+                    icon="💾",
+                )
+            except httpx.HTTPStatusError as e:
+                st.error(
+                    f"Backend rejected the configuration (HTTP {e.response.status_code}): {e.response.text}",
+                    icon="🚨",
+                )
+            except httpx.ConnectError:
+                st.error("Cannot reach the API backend. Is it running?", icon="🔴")
+            except Exception as e:
+                st.error(f"Failed to save configuration: {e}", icon="🚨")
+
+    # ── Backend Connection Info ──────────────────────────────────
+    st.divider()
+    st.markdown("### 🔌 Backend Connection")
+    st.code(f"API_BACKEND_URL = {API_URL}", language="text")
+    st.caption(
+        "This value is set via the `API_BACKEND_URL` environment variable "
+        "(see `docker-compose.yml`). It cannot be changed from the UI."
+    )

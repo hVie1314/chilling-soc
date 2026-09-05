@@ -1,13 +1,16 @@
 """
-SOC AI Triage System — FastAPI Backend (Orchestrator) v3.0
+SOC AI Triage System — FastAPI Backend (Orchestrator) v4.0
 
-Responsibilities:
-  • POST /analyze           – Embed events → RAG lookup → LLM triage → action routing → return JSON verdict
-  • POST /feedback          – Embed log → gradual trust upsert into Qdrant
+Implements io-routing-spec.md v1.0.0 in full:
+  • POST /analyze           – Source-aware triage → dynamic action routing → ActionReceipt list
+  • POST /feedback          – Gradual trust upsert into Qdrant
   • POST /webhook/feedback  – External Case Management webhook → gradual trust ingestion
+  • GET  /config            – Read SystemSettings from SQLite
+  • PUT  /config            – Persist SystemSettings to SQLite
   • GET  /health            – Liveness probe
 
 Labels (unified):  TruePositive | FalsePositive | Benign | Suspicious
+Input sources:     web_ui | api_siem
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ from datetime import datetime, timezone
 from typing import Literal, Optional
 
 import aiosqlite
+import httpx
 import numpy as np
 # pyrefly: ignore [missing-import]
 from fastapi import FastAPI, HTTPException, status
@@ -63,11 +67,106 @@ logger = logging.getLogger("soc-api")
 # ───────────────────────── Pydantic Models ───────────────────────
 
 UnifiedLabel = Literal["TruePositive", "FalsePositive", "Benign", "Suspicious"]
+InputSource = Literal["web_ui", "api_siem"]
+AuthType = Literal["none", "bearer", "api_key", "basic"]
+
+# ── Routing Configuration Models (spec §3.2) ─────────────────────
+
+
+class SourceRoutingConfig(BaseModel):
+    """Routing policy for a specific input source (web_ui or api_siem)."""
+    enable_case_mgmt_push: bool = False
+    enable_soar_autoclose: bool = False
+
+
+class GlobalRoutingConfig(BaseModel):
+    """Global overrides applied regardless of source."""
+    dry_run: bool = False
+    min_trust_score_for_autoclose: int = Field(default=1, ge=1, le=5)
+
+
+class RoutingConfig(BaseModel):
+    """Full routing policy matrix, keyed by input source."""
+    web_source: SourceRoutingConfig = Field(
+        default_factory=lambda: SourceRoutingConfig(
+            enable_case_mgmt_push=False, enable_soar_autoclose=False
+        )
+    )
+    api_source: SourceRoutingConfig = Field(
+        default_factory=lambda: SourceRoutingConfig(
+            enable_case_mgmt_push=True, enable_soar_autoclose=True
+        )
+    )
+    # Pydantic v2: use model_config to allow "global" as an alias
+    global_: GlobalRoutingConfig = Field(
+        default_factory=GlobalRoutingConfig,
+        alias="global",
+    )
+
+    model_config = {"populate_by_name": True}
+
+
+class DestinationEndpoint(BaseModel):
+    """Configuration for a downstream integration endpoint."""
+    url: str = Field(default="", description="Endpoint URL (Case Mgmt webhook or SOAR API)")
+    auth_type: AuthType = Field(default="none", description="Authentication strategy")
+    api_key: str = Field(default="", description="API Key or Bearer Token value")
+    timeout_seconds: float = Field(default=10.0, ge=1.0, le=60.0)
+
+
+class DestinationsConfig(BaseModel):
+    """Registry of all downstream dispatch targets."""
+    case_management: DestinationEndpoint = Field(default_factory=DestinationEndpoint)
+    soar_edge: DestinationEndpoint = Field(default_factory=DestinationEndpoint)
+
+
+class SystemSettings(BaseModel):
+    """Complete system configuration – persisted as JSON in SQLite system_config table."""
+    routing: RoutingConfig = Field(default_factory=RoutingConfig)
+    destinations: DestinationsConfig = Field(default_factory=DestinationsConfig)
+
+
+# ── Action Receipt Model ──────────────────────────────────────────
+
+
+class ActionReceipt(BaseModel):
+    """Records the outcome of a single downstream dispatch attempt."""
+    destination: str = Field(description="Target system: 'case_management', 'soar_edge', or 'all'")
+    status: Literal["success", "skipped", "failed", "dry_run_skipped"] = Field(
+        description="Execution result"
+    )
+    http_status: Optional[int] = Field(default=None, description="HTTP response code from target")
+    details: str = Field(default="", description="Short human-readable outcome description")
+    error: str = Field(default="", description="Error message if status is 'failed'")
+    timestamp: str = Field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat(),
+        description="ISO 8601 dispatch timestamp",
+    )
+
+
+# ── Routing Override Model ────────────────────────────────────────
+
+
+class RoutingOverrides(BaseModel):
+    """Per-request overrides to the persisted policy (optional)."""
+    force_case_push: bool = False
+    force_soar_close: bool = False
+
+
+# ── Request / Response Models ─────────────────────────────────────
 
 
 class AnalyzeRequest(BaseModel):
     alert_id: str = Field(default="default-alert", description="Alert identifier")
     events: list[str] = Field(..., min_length=1, description="List of raw event log entries")
+    source: InputSource = Field(
+        default="web_ui",
+        description="Origin of the alert: 'web_ui' (analyst) or 'api_siem' (automated pipeline)",
+    )
+    routing_overrides: RoutingOverrides = Field(
+        default_factory=RoutingOverrides,
+        description="Optional per-request overrides to the system routing policy",
+    )
 
 
 class TriageResult(BaseModel):
@@ -76,9 +175,14 @@ class TriageResult(BaseModel):
 
 
 class AnalyzeResponse(BaseModel):
+    alert_id: str
     result: UnifiedLabel
     reason: str
     similar_cases: list[dict] = Field(default_factory=list, description="RAG-retrieved past cases")
+    actions_dispatched: list[ActionReceipt] = Field(
+        default_factory=list,
+        description="List of downstream dispatch receipts executed for this alert",
+    )
 
 
 class FeedbackRequest(BaseModel):
@@ -132,12 +236,13 @@ def _ensure_collection(client: QdrantClient) -> None:
 # ───────────────────────── SQLite State Bridge ───────────────────
 
 async def _init_db() -> None:
-    """Create the SQLite database and cases table if they don't exist."""
+    """Create the SQLite database and all required tables if they don't exist."""
     db_dir = os.path.dirname(DB_PATH)
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
 
     async with aiosqlite.connect(DB_PATH) as db:
+        # ── Alert cases table ──
         await db.execute("""
             CREATE TABLE IF NOT EXISTS cases (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -149,6 +254,17 @@ async def _init_db() -> None:
         await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_cases_alert_id ON cases (alert_id)
         """)
+
+        # ── System configuration table (singleton row, id always = 1) ──
+        # Spec §5.1: one row stores the entire SystemSettings as JSON.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS system_config (
+                id          INTEGER PRIMARY KEY CHECK (id = 1),
+                config_json TEXT    NOT NULL,
+                updated_at  TEXT    NOT NULL
+            )
+        """)
+
         await db.commit()
     logger.info("SQLite database initialised at '%s'.", DB_PATH)
 
@@ -178,28 +294,44 @@ async def _get_events_by_alert_id(alert_id: str) -> list[str] | None:
     return None
 
 
-# ───────────────────────── Action Routing Scaffolding ─────────────
+# ───────────────────────── Configuration Persistence ─────────────
 
-async def dispatch_to_case_management(alert_id: str, events: list, reason: str) -> None:
+async def _load_config() -> SystemSettings:
     """
-    Stub: Dispatch alert to Case Management system for investigation.
-    In production, this would POST to a SOAR / Case Management API.
+    Read SystemSettings from the system_config table.
+    Returns hardcoded defaults (matching spec §3.2) on first run or missing row.
     """
-    logger.info(
-        "[ACTION] Dispatching to Case Management — alert_id=%s, events=%d, reason=%s",
-        alert_id, len(events), reason[:120],
-    )
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT config_json FROM system_config WHERE id = 1"
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    raw = json.loads(row[0])
+                    return SystemSettings.model_validate(raw)
+    except Exception:
+        logger.exception("Failed to load config from SQLite — using defaults.")
+    return SystemSettings()
 
 
-async def trigger_soar_edge_extension_close(alert_id: str, reason: str) -> None:
-    """
-    Stub: Trigger SOAR edge extension to auto-close the alert.
-    In production, this would call a SOAR API to close/dismiss the alert.
-    """
-    logger.info(
-        "[ACTION] Triggering SOAR auto-close — alert_id=%s, reason=%s",
-        alert_id, reason[:120],
-    )
+async def _save_config(settings: SystemSettings) -> None:
+    """Persist SystemSettings JSON to the system_config singleton row (id = 1)."""
+    config_json = settings.model_dump_json(by_alias=True)
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO system_config (id, config_json, updated_at)
+            VALUES (1, ?, ?)
+            ON CONFLICT(id) DO UPDATE
+                SET config_json = excluded.config_json,
+                    updated_at  = excluded.updated_at
+            """,
+            (config_json, now),
+        )
+        await db.commit()
+    logger.info("System configuration persisted to SQLite.")
 
 
 # ───────────────────────── Lifespan ──────────────────────────────
@@ -237,8 +369,8 @@ async def lifespan(application: FastAPI):  # noqa: ARG001
 
 app = FastAPI(
     title="SOC AI Triage API",
-    description="Security Operations Center – AI-powered log triage with RAG feedback loop",
-    version="3.0.0",
+    description="Security Operations Center – AI-powered log triage with RAG feedback loop and dynamic I/O routing",
+    version="4.0.0",
     lifespan=lifespan,
 )
 
@@ -249,7 +381,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ───────────────────────── Helpers ───────────────────────────────
+# ───────────────────────── Embedding & RAG Helpers ───────────────
 
 def _embed(text: str) -> list[float]:
     """Produce a dense vector from text using the sentence-transformer model."""
@@ -347,7 +479,6 @@ def _parse_llm_response(content: str) -> TriageResult:
     # Strip markdown code fences if present
     if text.startswith("```"):
         lines = text.split("\n")
-        # Remove first line (```json or ```) and last line (```)
         lines = [l for l in lines if not l.strip().startswith("```")]
         text = "\n".join(lines).strip()
 
@@ -476,6 +607,238 @@ async def _apply_gradual_trust(
     )
 
 
+# ───────────────────────── Action Routing Engine ─────────────────
+# Implements io-routing-spec.md §5.2 and §5.3
+
+async def dispatch_to_case_management(
+    endpoint: DestinationEndpoint,
+    alert_id: str,
+    events: list[str],
+    verdict: str,
+    reason: str,
+) -> ActionReceipt:
+    """
+    Spec §5.3: Real HTTP dispatcher for Case Management systems.
+    Supports bearer token, X-API-Key, and unauthenticated calls.
+    """
+    if not endpoint.url:
+        logger.info("[ROUTING] Case Management URL not configured — skipping dispatch.")
+        return ActionReceipt(
+            destination="case_management",
+            status="skipped",
+            details="No webhook URL configured. Set it via PUT /config.",
+        )
+
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+
+    if endpoint.auth_type == "bearer" and endpoint.api_key:
+        headers["Authorization"] = f"Bearer {endpoint.api_key}"
+    elif endpoint.auth_type == "api_key" and endpoint.api_key:
+        headers["X-API-Key"] = endpoint.api_key
+    elif endpoint.auth_type == "basic" and endpoint.api_key:
+        # api_key field carries "username:password" for basic auth
+        import base64
+        encoded = base64.b64encode(endpoint.api_key.encode()).decode()
+        headers["Authorization"] = f"Basic {encoded}"
+
+    payload = {
+        "alert_id": alert_id,
+        "events": events,
+        "verdict": verdict,
+        "triage_summary": reason,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    logger.info(
+        "[ROUTING] Dispatching to Case Management — alert_id=%s, verdict=%s, url=%s",
+        alert_id, verdict, endpoint.url,
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=endpoint.timeout_seconds) as client:
+            resp = await client.post(endpoint.url, json=payload, headers=headers)
+            resp.raise_for_status()
+            logger.info(
+                "[ROUTING] Case Management dispatch succeeded — HTTP %d for alert_id=%s",
+                resp.status_code, alert_id,
+            )
+            return ActionReceipt(
+                destination="case_management",
+                status="success",
+                http_status=resp.status_code,
+                details=resp.text[:200],
+            )
+    except httpx.HTTPStatusError as exc:
+        logger.error(
+            "[ROUTING] Case Management returned HTTP %d: %s",
+            exc.response.status_code, exc.response.text[:200],
+        )
+        return ActionReceipt(
+            destination="case_management",
+            status="failed",
+            http_status=exc.response.status_code,
+            error=f"HTTP {exc.response.status_code}: {exc.response.text[:200]}",
+        )
+    except Exception as exc:
+        logger.error("[ROUTING] Case Management dispatch failed: %s", exc)
+        return ActionReceipt(
+            destination="case_management",
+            status="failed",
+            error=str(exc),
+        )
+
+
+async def trigger_soar_edge_extension_close(
+    endpoint: DestinationEndpoint,
+    alert_id: str,
+    verdict: str,
+    reason: str,
+) -> ActionReceipt:
+    """
+    Spec §5.3: Real HTTP dispatcher for SOAR Edge auto-close.
+    Supports bearer token, X-API-Key, and unauthenticated calls.
+    """
+    if not endpoint.url:
+        logger.info("[ROUTING] SOAR Edge URL not configured — skipping auto-close.")
+        return ActionReceipt(
+            destination="soar_edge",
+            status="skipped",
+            details="No SOAR API URL configured. Set it via PUT /config.",
+        )
+
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+
+    if endpoint.auth_type == "bearer" and endpoint.api_key:
+        headers["Authorization"] = f"Bearer {endpoint.api_key}"
+    elif endpoint.auth_type == "api_key" and endpoint.api_key:
+        headers["X-API-Key"] = endpoint.api_key
+    elif endpoint.auth_type == "basic" and endpoint.api_key:
+        import base64
+        encoded = base64.b64encode(endpoint.api_key.encode()).decode()
+        headers["Authorization"] = f"Basic {encoded}"
+
+    payload = {
+        "alert_id": alert_id,
+        "action": "auto_close",
+        "verdict": verdict,
+        "reason": reason,
+        "closed_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    logger.info(
+        "[ROUTING] Triggering SOAR auto-close — alert_id=%s, verdict=%s, url=%s",
+        alert_id, verdict, endpoint.url,
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=endpoint.timeout_seconds) as client:
+            resp = await client.post(endpoint.url, json=payload, headers=headers)
+            resp.raise_for_status()
+            logger.info(
+                "[ROUTING] SOAR auto-close succeeded — HTTP %d for alert_id=%s",
+                resp.status_code, alert_id,
+            )
+            return ActionReceipt(
+                destination="soar_edge",
+                status="success",
+                http_status=resp.status_code,
+                details=resp.text[:200],
+            )
+    except httpx.HTTPStatusError as exc:
+        logger.error(
+            "[ROUTING] SOAR returned HTTP %d: %s",
+            exc.response.status_code, exc.response.text[:200],
+        )
+        return ActionReceipt(
+            destination="soar_edge",
+            status="failed",
+            http_status=exc.response.status_code,
+            error=f"HTTP {exc.response.status_code}: {exc.response.text[:200]}",
+        )
+    except Exception as exc:
+        logger.error("[ROUTING] SOAR auto-close dispatch failed: %s", exc)
+        return ActionReceipt(
+            destination="soar_edge",
+            status="failed",
+            error=str(exc),
+        )
+
+
+async def route_actions(
+    alert_id: str,
+    events: list[str],
+    triage: TriageResult,
+    source: InputSource,
+    overrides: RoutingOverrides,
+    config: SystemSettings,
+) -> list[ActionReceipt]:
+    """
+    Spec §5.2: Dynamic action routing engine.
+    Evaluates dry_run, source-based policies, and per-request overrides.
+    Returns a list of ActionReceipt objects to embed in AnalyzeResponse.
+    """
+    receipts: list[ActionReceipt] = []
+
+    # ── 1. Global Dry Run Guard ───────────────────────────────────
+    if config.routing.global_.dry_run:
+        logger.info("[ROUTING] Dry-run mode active — all side-effects suppressed.")
+        return [
+            ActionReceipt(
+                destination="all",
+                status="dry_run_skipped",
+                details="Global dry-run mode is enabled. No external systems were contacted.",
+            )
+        ]
+
+    # ── 2. Resolve policy from input source ───────────────────────
+    policy: SourceRoutingConfig = (
+        config.routing.web_source if source == "web_ui" else config.routing.api_source
+    )
+
+    logger.info(
+        "[ROUTING] Evaluating policy for source=%s, verdict=%s | "
+        "case_push=%s, soar_close=%s | overrides: force_case=%s, force_soar=%s",
+        source, triage.result,
+        policy.enable_case_mgmt_push, policy.enable_soar_autoclose,
+        overrides.force_case_push, overrides.force_soar_close,
+    )
+
+    # ── 3. Route TruePositive / Suspicious → Case Management ──────
+    if triage.result in ("TruePositive", "Suspicious"):
+        should_push = policy.enable_case_mgmt_push or overrides.force_case_push
+        if should_push:
+            receipt = await dispatch_to_case_management(
+                endpoint=config.destinations.case_management,
+                alert_id=alert_id,
+                events=events,
+                verdict=triage.result,
+                reason=triage.reason,
+            )
+            receipts.append(receipt)
+        else:
+            logger.info(
+                "[ROUTING] Case Management push disabled for source=%s — no dispatch.", source
+            )
+
+    # ── 4. Route FalsePositive / Benign → SOAR Auto-Close ─────────
+    elif triage.result in ("FalsePositive", "Benign"):
+        should_close = policy.enable_soar_autoclose or overrides.force_soar_close
+        if should_close:
+            receipt = await trigger_soar_edge_extension_close(
+                endpoint=config.destinations.soar_edge,
+                alert_id=alert_id,
+                verdict=triage.result,
+                reason=triage.reason,
+            )
+            receipts.append(receipt)
+        else:
+            logger.info(
+                "[ROUTING] SOAR auto-close disabled for source=%s — no dispatch.", source
+            )
+
+    return receipts
+
+
 # ───────────────────────── Endpoints ─────────────────────────────
 
 @app.get("/health", tags=["ops"])
@@ -511,25 +874,59 @@ async def health_check():
     return health
 
 
+@app.get(
+    "/config",
+    response_model=SystemSettings,
+    tags=["config"],
+    summary="Get current system routing & destination configuration",
+)
+async def get_config():
+    """
+    Read the persisted SystemSettings from SQLite.
+    Returns factory defaults if no configuration has been saved yet.
+    API keys are returned as stored (frontend should mask them).
+    """
+    settings = await _load_config()
+    logger.info("GET /config — returning current system settings.")
+    return settings
+
+
+@app.put(
+    "/config",
+    tags=["config"],
+    summary="Update system routing & destination configuration",
+)
+async def update_config(settings: SystemSettings):
+    """
+    Persist SystemSettings JSON to the system_config singleton table.
+    This is the canonical write path from the Streamlit Settings UI.
+    """
+    await _save_config(settings)
+    logger.info("PUT /config — system settings saved successfully.")
+    return {"status": "saved", "updated_at": datetime.now(timezone.utc).isoformat()}
+
+
 @app.post(
     "/analyze",
     response_model=AnalyzeResponse,
     tags=["triage"],
-    summary="Triage a multi-event security alert",
+    summary="Triage a multi-event security alert with dynamic I/O routing",
 )
 async def analyze_log(req: AnalyzeRequest):
     """
+    Full triage pipeline per io-routing-spec.md §4.1 and §5:
+
     1. Save alert to SQLite state bridge.
-    2. Iterate through events, embed each unique event.
-    3. Query Qdrant per event and aggregate RAG context (deduplicated).
-    4. Construct a multi-event prompt and call the LLM.
-    5. Parse the structured JSON verdict.
-    6. Route action based on verdict.
-    7. Return result.
+    2. Embed each unique event and aggregate RAG context (deduplicated).
+    3. Construct a multi-event prompt and call the LLM.
+    4. Parse the structured JSON verdict.
+    5. Load SystemSettings from SQLite.
+    6. Execute route_actions() based on source, verdict, and policies.
+    7. Return verdict + actions_dispatched receipts.
     """
     logger.info(
-        "Received /analyze request — alert_id=%s, %d event(s).",
-        req.alert_id, len(req.events),
+        "Received /analyze request — alert_id=%s, source=%s, %d event(s).",
+        req.alert_id, req.source, len(req.events),
     )
 
     # Step 0 – persist to SQLite BEFORE analysis
@@ -618,19 +1015,27 @@ async def analyze_log(req: AnalyzeRequest):
     # Step 5 – parse
     triage = _parse_llm_response(raw_content)
 
-    # Step 6 – action routing
+    # Step 6 – load config and execute dynamic routing
+    config = await _load_config()
+    actions_dispatched: list[ActionReceipt] = []
     try:
-        if triage.result in ("TruePositive", "Suspicious"):
-            await dispatch_to_case_management(req.alert_id, req.events, triage.reason)
-        elif triage.result in ("FalsePositive", "Benign"):
-            await trigger_soar_edge_extension_close(req.alert_id, triage.reason)
+        actions_dispatched = await route_actions(
+            alert_id=req.alert_id,
+            events=req.events,
+            triage=triage,
+            source=req.source,
+            overrides=req.routing_overrides,
+            config=config,
+        )
     except Exception:
-        logger.exception("Action routing failed — verdict still returned to caller.")
+        logger.exception("route_actions raised an unexpected error — verdict still returned.")
 
     return AnalyzeResponse(
+        alert_id=req.alert_id,
         result=triage.result,
         reason=triage.reason,
         similar_cases=aggregated_cases,
+        actions_dispatched=actions_dispatched,
     )
 
 
