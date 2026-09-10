@@ -1,14 +1,16 @@
 
 # ─────────────────────────────────────────────────────────────
-# SOC AI Triage System – Docker Compose
+# chilling-soc – Docker Compose
 # 4 containers: vector-db · llm-engine · api-backend · web-ui
 # ─────────────────────────────────────────────────────────────
+
+name: chilling-soc
 
 services:
   # ── 1. Qdrant vector database ──────────────────────────────
   vector-db:
     image: qdrant/qdrant:latest
-    container_name: soc-vector-db
+    container_name: chilling-soc-vector-db
     ports:
       - "6333:6333"   # REST API
       - "6334:6334"   # gRPC
@@ -21,14 +23,14 @@ services:
       retries: 10
       start_period: 15s
     networks:
-      - soc-net
+      - chilling-soc-net
     restart: unless-stopped
 
   # ── 2. vLLM serving Foundation-Sec-8B (production only) ──────
   llm-engine:
     profiles: ["prod"]
     image: vllm/vllm-openai:latest
-    container_name: soc-llm-engine
+    container_name: chilling-soc-llm-engine
     ports:
       - "8000:8000"
     volumes:
@@ -59,7 +61,7 @@ services:
       retries: 30
       start_period: 120s
     networks:
-      - soc-net
+      - chilling-soc-net
     restart: unless-stopped
 
   # ── 3. FastAPI orchestrator backend ────────────────────────
@@ -67,7 +69,7 @@ services:
     build:
       context: ./api-backend
       dockerfile: Dockerfile
-    container_name: soc-api-backend
+    container_name: chilling-soc-api-backend
     ports:
       - "8080:8080"
     environment:
@@ -78,6 +80,8 @@ services:
       - COLLECTION_NAME=${COLLECTION_NAME:-soc_knowledge_base}
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-nomic-ai/nomic-embed-text-v1.5}
       - LOG_LEVEL=info
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       vector-db:
         condition: service_healthy
@@ -88,7 +92,7 @@ services:
       retries: 10
       start_period: 30s
     networks:
-      - soc-net
+      - chilling-soc-net
     restart: unless-stopped
 
   # ── 4. Streamlit user interface ────────────────────────────
@@ -96,7 +100,7 @@ services:
     build:
       context: ./web-ui
       dockerfile: Dockerfile
-    container_name: soc-web-ui
+    container_name: chilling-soc-web-ui
     ports:
       - "8501:8501"
     environment:
@@ -105,11 +109,11 @@ services:
       api-backend:
         condition: service_healthy
     networks:
-      - soc-net
+      - chilling-soc-net
     restart: unless-stopped
 
 volumes: {}
 
 networks:
-  soc-net:
+  chilling-soc-net:
     driver: bridge
