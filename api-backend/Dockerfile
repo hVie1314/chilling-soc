@@ -22,6 +22,8 @@ RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTr
 
 COPY main.py .
 
+RUN mkdir -p /app/data && chown -R appuser:appuser /app/data
+
 # Switch to non-root
 USER appuser
 
