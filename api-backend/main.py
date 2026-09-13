@@ -9,6 +9,8 @@ Responsibilities:
 
 from __future__ import annotations
 
+import re
+
 import asyncio
 import json
 import logging
@@ -79,6 +81,18 @@ class FeedbackResponse(BaseModel):
     action: str = Field(default="inserted", description="'inserted', 'reinforced', or 'corrected'")
     trust_score: int = Field(default=1)
 
+
+class ChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, description="Analyst query")
+    session_id: str = Field(default="", description="Case ID or session identifier")
+    case_context: str = Field(default="", description="Optional context about the incident")
+
+
+class ChatResponse(BaseModel):
+    response: str
+    model: str
+    session_id: str
+
 # ───────────────────────── Global Resources ──────────────────────
 
 embedder: SentenceTransformer | None = None
@@ -138,8 +152,11 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=86400,
 )
 
 # ───────────────────────── Helpers ───────────────────────────────
@@ -232,25 +249,43 @@ def _build_prompt(events: list[str], similar_cases: list[dict]) -> list[dict]:
 def _parse_llm_response(content: str) -> TriageResult:
     """
     Parse the LLM response into a TriageResult.
-    Handles both clean JSON and responses wrapped in markdown code fences.
+    Handles (in order):
+      1. Clean JSON
+      2. Markdown code fences (```json ... ```)
+      3. Regex extraction of the first {...} JSON object in free-text
+      4. Safe fallback — classify as TP with original text as reason
     """
     text = content.strip()
 
-    # Strip markdown code fences if present
+    # ── 1. Strip markdown code fences if present ──
     if text.startswith("```"):
         lines = text.split("\n")
-        # Remove first line (```json or ```) and last line (```)
         lines = [l for l in lines if not l.strip().startswith("```")]
         text = "\n".join(lines).strip()
 
+    # ── 2. Try direct JSON parse ──
     try:
         data = json.loads(text)
-    except json.JSONDecodeError as exc:
-        logger.error("LLM returned non-JSON: %s", text[:500])
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"LLM returned unparseable response: {text[:300]}",
-        ) from exc
+    except json.JSONDecodeError:
+        # ── 3. Regex: extract first {...} block from free-text ──
+        match = re.search(r"\{[^{}]*\}", text, re.DOTALL)
+        if match:
+            try:
+                data = json.loads(match.group())
+                logger.warning("LLM response was not pure JSON; extracted JSON block via regex.")
+            except json.JSONDecodeError:
+                data = None
+        else:
+            data = None
+
+        if data is None:
+            # ── 4. Safe fallback: cannot parse → TP with truncated text as reason ──
+            logger.error(
+                "LLM returned unparseable response (len=%d): %s",
+                len(text), text[:300],
+            )
+            reason_fallback = text[:300] if text else "LLM did not return a structured response."
+            return TriageResult(result="TP", reason=reason_fallback)
 
     result_val = data.get("result", "").strip()
     reason_val = data.get("reason", "No reason provided.").strip()
@@ -351,17 +386,18 @@ async def analyze_log(req: AnalyzeRequest):
 
     chat_response = None
     try:
-        # Attempt with vLLM guided decoding
+        # Attempt with response_format and guided_json
         chat_response = await llm_client.chat.completions.create(  # type: ignore[union-attr]
             model=LLM_MODEL,
             messages=messages,
             temperature=0.1,
             max_tokens=256,
+            response_format={"type": "json_object"},
             extra_body={"guided_json": guided_json_schema},
         )
     except Exception as guided_exc:
         logger.warning(
-            "LLM call with guided_json failed (%s); retrying without it.",
+            "LLM call with guided_json failed (%s); retrying with standard json_object.",
             type(guided_exc).__name__,
         )
         try:
@@ -370,6 +406,7 @@ async def analyze_log(req: AnalyzeRequest):
                 messages=messages,
                 temperature=0.1,
                 max_tokens=256,
+                response_format={"type": "json_object"},
             )
         except Exception as plain_exc:
             logger.exception("LLM call failed.")
@@ -498,4 +535,67 @@ async def submit_feedback(req: FeedbackRequest):
         point_id=point_id,
         action=action,
         trust_score=trust_score,
+    )
+
+
+@app.post(
+    "/chat",
+    response_model=ChatResponse,
+    tags=["chat"],
+    summary="Interactive SOC Incident Copilot Chat with RAG Context",
+)
+async def chat_incident(req: ChatRequest):
+    """
+    Interactive SOC Copilot:
+    Answers analyst queries about the incident, logs, attack behavior, and containment steps.
+    """
+    logger.info("Received /chat request — session_id=%s, len=%d", req.session_id, len(req.message))
+
+    # Optional RAG lookup based on query and context
+    search_query = f"{req.case_context} {req.message}".strip()
+    vector = _embed(search_query)
+    similar_cases = _search_similar(vector, top_k=2)
+
+    system_prompt = (
+        "Bạn là CyberAI Copilot — Trợ lý Chuyên gia Phân tích Sự cố SOC thuộc Trung tâm Giám sát Điều hành An ninh Mạng NCS (NCS Fusion Center).\n"
+        "Nhiệm vụ của bạn là hỗ trợ Phân tích viên SOC (Analyst) điều tra, mổ xẻ hành vi mã độc/lệnh shell, giải thích mức độ nguy hại, "
+        "và đề xuất các phương án xử lý, ngăn chặn, cô lập khẩn cấp.\n"
+        "QUY TẮC PHẢN HỒI:\n"
+        "1. Trả lời bằng Tiếng Việt kỹ thuật chuyên nghiệp, súc tích, đi thẳng vào bản chất kỹ thuật (MITRE ATT&CK, tiến trình, log forensics).\n"
+        "2. Không dài dòng triết lý. Nêu rõ các bước hành động cụ thể khi được hỏi về cô lập/xử lý.\n"
+        "3. Nếu có mã độc hoặc lệnh cmd/powershell bất thường (như w3wp.exe sinh cmd whoami), giải thích rõ cơ chế webshell/RCE."
+    )
+
+    messages = [{"role": "system", "content": system_prompt}]
+
+    if similar_cases:
+        rag_context = "### Cơ sở tri thức tương đồng từ quá khứ (RAG):\n"
+        for c in similar_cases:
+            rag_context += f"- Log: {c.get('raw_log', '')[:200]} | Nhãn: [{c.get('label', '')}] | Ghi chú: {c.get('comment', '')}\n"
+        messages.append({"role": "system", "content": rag_context})
+
+    if req.case_context:
+        messages.append({"role": "system", "content": f"### Bối cảnh Sự cố Hiện tại:\n{req.case_context}"})
+
+    messages.append({"role": "user", "content": req.message})
+
+    try:
+        chat_completion = await llm_client.chat.completions.create(  # type: ignore[union-attr]
+            model=LLM_MODEL,
+            messages=messages,
+            temperature=0.2,
+            max_tokens=512,
+        )
+        content = chat_completion.choices[0].message.content or "Không thể khởi tạo nội dung phản hồi từ AI."
+    except Exception as exc:
+        logger.exception("LLM chat completion failed.")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Lỗi kết nối tới mô hình AI LLM: {exc}",
+        ) from exc
+
+    return ChatResponse(
+        response=content.strip(),
+        model=LLM_MODEL,
+        session_id=req.session_id,
     )
